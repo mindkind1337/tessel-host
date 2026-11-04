@@ -4,6 +4,16 @@ Each release is a tag `v<version>` whose CI publishes the static programs (x86_6
 musl), `manifest.json`, `SHA256SUMS` and `LICENSE`. The protocol version is still 1 in every
 release below: new fields are optional, and a client relying on one says which release it needs.
 
+## Unreleased
+
+Client (`tessel-host-client`), no daemon change:
+
+- `Terminal::create_keyed` takes the deduplication key from the caller and the epoch it means,
+  so a create whose reply was lost can be sent again within the same run of the desktop and
+  find the same terminal and lease (the daemon keeps the outcome 10 minutes, per run). Another
+  epoch answers `EpochChanged` without sending; a terminal still being created (`busy`) is
+  retried briefly.
+
 ## 0.1.1
 
 Daemon and protocol:

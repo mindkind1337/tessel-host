@@ -85,7 +85,18 @@ retry by themselves where that is safe, and say so otherwise.
 
 ```rust
 let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
+// or, to be able to recover a create whose reply was lost:
+let (terminal, events) = Terminal::create_keyed(&client, key, &epoch, argv, cwd, env, size)?;
 ```
+
+- `create_keyed` takes a deduplication key the desktop draws (16 random bytes) and the epoch it
+  means. The same key sent again returns the same terminal and lease, but only on the same
+  daemon run and within 10 minutes of the daemon finishing the first request, by the daemon's
+  clock. The desktop only knows when it first sent the key, so it resends only within the same
+  run of the desktop, timed by a monotonic clock, and well inside the 10 minutes (at most
+  8 minutes). After a restart of the desktop it never resends a key, whatever the wall clock
+  says. It lists the host's terminals and attaches explicitly instead. The key is a capability,
+  kept like the lease. Another epoch answers `EpochChanged` without sending anything.
 
 - Keep `terminal.id()` and `client.epoch()` with the pane. After a restart of the desktop the
   pane shows nothing, so attach with `Terminal::attach_fresh(&client, id, epoch, lease)`: the

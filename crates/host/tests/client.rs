@@ -431,6 +431,74 @@ fn dropping_only_the_receiver_lets_go_at_the_next_event() {
     client.close();
 }
 
+/// A create whose reply never arrived, sent again with the same key over another connection
+/// to the same daemon: the same terminal and lease, one program. A key meant for another epoch
+/// sends nothing.
+#[test]
+fn the_same_key_finds_the_terminal_a_lost_reply_created() {
+    let mut home = Home::new("clientkeyed");
+    let (first, _connector_first) = connect(&mut home);
+    let (second, _connector_second) = connect(&mut home);
+    let epoch = first.epoch().unwrap();
+    let key = tessel_host_protocol::DedupKey::from_bytes([0x5a; 16]);
+    let size = Size { rows: 24, cols: 80 };
+    let (original, _events) = Terminal::create_keyed(
+        &first,
+        key.clone(),
+        &epoch,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        size,
+    )
+    .unwrap();
+    // The desktop never saw that reply; it sends the same key again.
+    let (again, _events_again) = Terminal::create_keyed(
+        &second,
+        key,
+        &epoch,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        size,
+    )
+    .unwrap();
+    assert_eq!(again.id(), original.id());
+    assert_eq!(again.lease(), original.lease());
+    assert_eq!(again.pid, original.pid);
+    let listed: tessel_host_protocol::pty::Listed = second
+        .ask(
+            tessel_host_protocol::pty::kind::LIST,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+    assert_eq!(listed.terminals.len(), 1, "one program");
+
+    let other = tessel_host_protocol::Epoch::from_bytes([0x11; 16]);
+    let refused = Terminal::create_keyed(
+        &second,
+        tessel_host_protocol::DedupKey::from_bytes([0x6b; 16]),
+        &other,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        size,
+    );
+    assert!(matches!(
+        refused,
+        Err(tessel_host_client::ClientError::EpochChanged)
+    ));
+    let listed: tessel_host_protocol::pty::Listed = second
+        .ask(
+            tessel_host_protocol::pty::kind::LIST,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+    assert_eq!(listed.terminals.len(), 1, "nothing sent for another epoch");
+    first.close();
+    second.close();
+}
+
 #[test]
 fn a_cut_link_reconnects_and_the_terminal_continues_exactly() {
     let mut home = Home::new("clientcut");

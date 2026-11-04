@@ -179,16 +179,72 @@ impl Terminal {
         env: BTreeMap<String, String>,
         size: Size,
     ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
+        let epoch = client.epoch().ok_or(ClientError::ConnectionLost)?;
+        Self::create_keyed(client, random_key(), &epoch, argv, cwd, env, size)
+    }
+
+    /// As `create`, with the deduplication key chosen and kept by the caller (16 random
+    /// bytes), on the daemon of `epoch` only.
+    ///
+    /// The daemon answers the same key with the same terminal and lease instead of starting
+    /// another program, but only within its own run and for 10 minutes after it finished the
+    /// first request, timed by its own clock. A caller cannot see that moment, only a lower
+    /// bound: when it first sent the key. So send the same key again only within the same run
+    /// of the desktop, timed with a monotonic clock (`Instant`) from the first send, and well
+    /// inside the 10 minutes: at most 10 minutes minus `request_timeout` minus a margin (8
+    /// minutes is safe). Never resend a key after the desktop restarted, whatever the wall
+    /// clock says (it may have moved back): look at the host's terminals (`terminal.list`)
+    /// and attach explicitly instead. A key the daemon forgot starts a second program.
+    ///
+    /// The key is a capability: whoever sends it within that time gets the terminal and its
+    /// lease. Keep it like the lease, never in plain text.
+    ///
+    /// `epoch` is the daemon the caller means: if the link reaches another one (it restarted:
+    /// its keys and terminals are gone), this answers `EpochChanged` without sending anything.
+    /// A daemon still creating the terminal for an earlier request answers `busy`; that is
+    /// retried briefly.
+    pub fn create_keyed(
+        client: &Client,
+        dedup: DedupKey,
+        epoch: &Epoch,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: BTreeMap<String, String>,
+        size: Size,
+    ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
         let request = Create {
-            dedup: random_key(),
+            dedup,
             argv,
             cwd,
             env,
             size,
         };
-        let created: Created = client.retrying(|| client.ask(pty::kind::CREATE, &request))?;
-        let epoch = client.epoch().ok_or(ClientError::ConnectionLost)?;
-        Self::attach(client, created.terminal, epoch, 0, Some(created.lease))
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut pause = Duration::from_millis(50);
+        let created: Created = loop {
+            let attempt = client.retrying(|| {
+                if client.epoch().as_ref() != Some(epoch) {
+                    return Err(ClientError::EpochChanged);
+                }
+                client.ask(pty::kind::CREATE, &request)
+            });
+            match attempt {
+                Err(ClientError::Refused(e))
+                    if e.code == ErrorCode::Busy && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(500));
+                }
+                other => break other?,
+            }
+        };
+        Self::attach(
+            client,
+            created.terminal,
+            epoch.clone(),
+            0,
+            Some(created.lease),
+        )
     }
 
     /// Attaches to a terminal this pane still shows (after `after`, the last event it applied),
