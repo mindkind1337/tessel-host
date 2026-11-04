@@ -140,6 +140,16 @@ blocking. Not verified: a real quota (EDQUOT has the same path as ENOSPC), a
 real host's file systems (network ones, noexec, no fallocate), files near the
 512 MiB limit, and desktop dirty-buffer handling (gate 7).
 
+After the gate 3 review (Franklin, 8 points), all fixed with a test each: an
+input refused as busy and retried after later ones is typed, never taken for a
+duplicate (a window of the last 1024 applied identifiers, older ones refused);
+a closed terminal's history leaves the daemon-wide budget; close waits for slow
+watchers to receive the last bytes and the exit (60 s at most); the previous
+holder gets `terminal.lease_lost`; a stale `resume` attaches as a watcher;
+resizes are numbered events every attachment receives; the exit comes once,
+only as an event; snapshots include the main screen behind the alternate one,
+the kitty keyboard flags per screen, focus reporting and the cursor style.
+
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both
 consume it and it has its own releases and CI. tessel-rust depends on a pinned

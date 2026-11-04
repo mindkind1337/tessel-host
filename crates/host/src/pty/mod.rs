@@ -1,22 +1,25 @@
 //! The daemon's terminals. Each has a pseudo-terminal, a program in its own session, one I/O
 //! thread (reads output, writes queued input, never blocks on either), a waiter that records
-//! the exit without reaping early, a bounded replay ring of numbered output chunks, and a
-//! screen model for snapshots. Terminals belong to the daemon, not to a connection: losing a
-//! connection only drops its attachments. One lock guards them all, so replay history is
-//! bounded across terminals, not only per terminal.
+//! the exit without reaping early, a bounded replay ring of numbered events (output chunks and
+//! resizes), and a screen model for snapshots. Terminals belong to the daemon, not to a
+//! connection: losing a connection only drops its attachments. One lock guards them all, so
+//! replay history is bounded across terminals, not only per terminal.
+mod modes;
 pub mod spawn;
 
 use crate::outbound::Outbound;
 use crate::runtime::random_bytes;
-use std::collections::{HashMap, VecDeque};
+use modes::Modes;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessel_host_protocol::pty::{
     self, Attach, AttachMode, Attached, Close, Create, Created, Detach, Exit, Input, InputOk,
-    Listed, Output, Resize, Signal, SignalRequest, Size, Snapshot, TerminalInfo, Writer,
+    LeaseLost, Listed, Output, Resize, Resized, Signal, SignalRequest, Size, Snapshot,
+    TerminalInfo, Writer,
 };
 use tessel_host_protocol::{
     Ack, Chunk, Dedup, DedupCache, Epoch, ErrorCode, HostFrame, LeaseKey, MAX_CHUNK_BYTES,
@@ -31,6 +34,10 @@ const SCROLLBACK_ROWS: usize = 0;
 /// Room for an event's envelope beside its data, for the acknowledgment window.
 const EVENT_OVERHEAD: usize = 256;
 const CLOSE_GRACE: Duration = Duration::from_secs(3);
+/// A closed terminal stays until every attachment received its end, or this long after.
+const CLOSED_LINGER: Duration = Duration::from_secs(60);
+/// Applied input identifiers remembered per lease.
+const INPUT_WINDOW: usize = 1024;
 /// A 64 KiB output chunk, in base64, inside one frame: terminals need at least this frame budget.
 pub const MIN_FRAME_BYTES: usize = 96 * 1024;
 
@@ -72,11 +79,52 @@ struct Attachment {
     snapshot: VecDeque<Snapshot>,
     exit_sent: bool,
     started: bool,
+    holds_lease: bool,
 }
 
 struct Lease {
     key: LeaseKey,
-    last_input: u64,
+    applied: VecDeque<u64>,
+    seen: HashSet<u64>,
+    /// The largest identifier forgotten from the window.
+    forgotten: u64,
+}
+
+impl Lease {
+    fn new(key: LeaseKey) -> Self {
+        Self {
+            key,
+            applied: VecDeque::new(),
+            seen: HashSet::new(),
+            forgotten: 0,
+        }
+    }
+
+    fn remember(&mut self, id: u64) {
+        self.applied.push_back(id);
+        self.seen.insert(id);
+        if self.applied.len() > INPUT_WINDOW
+            && let Some(old) = self.applied.pop_front()
+        {
+            self.seen.remove(&old);
+            self.forgotten = self.forgotten.max(old);
+        }
+    }
+}
+
+/// One numbered event of a terminal: output, or a change of size between two outputs.
+enum Item {
+    Output(Vec<u8>),
+    Resized(Size),
+}
+
+impl Item {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Output(data) => data.len(),
+            Self::Resized(_) => 16,
+        }
+    }
 }
 
 struct Term {
@@ -85,17 +133,19 @@ struct Term {
     wake: Arc<OwnedFd>,
     size: Size,
     seq: u64,
-    ring: VecDeque<Vec<u8>>,
+    ring: VecDeque<Item>,
     ring_bytes: usize,
     ring_cap: usize,
-    /// Sequence number of the oldest chunk in `ring` (seq + 1 when empty).
+    /// Sequence number of the oldest item in `ring` (seq + 1 when empty).
     first: u64,
     parser: vt100::Parser,
+    modes: Modes,
     lease: Option<Lease>,
     pending: VecDeque<u8>,
     eof: bool,
     status: Option<(Option<i32>, Option<i32>)>,
     exit: Option<Exit>,
+    exited_at: Option<Instant>,
     closing: bool,
     attachments: Vec<Attachment>,
 }
@@ -107,13 +157,51 @@ struct State {
     creates: DedupCache<Created>,
 }
 
+impl State {
+    /// Forgets a terminal and what its history counted against the daemon's budget.
+    fn remove(&mut self, terminal: &TerminalId) {
+        if let Some(term) = self.terms.remove(terminal) {
+            self.total_bytes -= term.ring_bytes;
+        }
+    }
+
+    /// A closed terminal goes once every attachment received its end, or after CLOSED_LINGER.
+    fn reap(&mut self, terminal: &TerminalId) {
+        let Some(term) = self.terms.get(terminal) else {
+            return;
+        };
+        let delivered = term
+            .attachments
+            .iter()
+            .all(|a| a.exit_sent || a.peer.out.is_closed());
+        let lingered = term
+            .exited_at
+            .is_some_and(|at| at.elapsed() >= CLOSED_LINGER);
+        if term.closing && term.exit.is_some() && (delivered || lingered) {
+            self.remove(terminal);
+        }
+    }
+
+    fn reap_all(&mut self) {
+        let closing: Vec<TerminalId> = self
+            .terms
+            .iter()
+            .filter(|(_, t)| t.closing)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in closing {
+            self.reap(&id);
+        }
+    }
+}
+
 pub struct Terminals {
     state: Mutex<State>,
     epoch: Epoch,
-    started: std::time::Instant,
+    started: Instant,
 }
 
-fn now_ms(start: std::time::Instant) -> u64 {
+fn now_ms(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
@@ -149,7 +237,7 @@ impl Term {
     }
 
     fn snapshot(&self, resync: bool) -> VecDeque<Snapshot> {
-        snapshot_of(&self.parser, self.size, self.seq, resync)
+        snapshot_of(&self.parser, &self.modes, self.size, self.seq, resync)
     }
 
     fn check_lease(&self, lease: &LeaseKey) -> Result<(), WireError> {
@@ -166,24 +254,24 @@ impl Term {
         self.status.is_none()
     }
 
-    /// Sends what each started attachment may: pending snapshot parts, then output, then the
-    /// exit, as far as its window allows. An attachment whose next chunk was evicted gets a
-    /// new snapshot instead (a gap it is told about), never a hole.
+    /// Sends what each started attachment may: pending snapshot parts, then numbered events,
+    /// then the exit, as far as its window allows. An attachment whose next event was evicted
+    /// gets a new snapshot instead (a gap it is told about), never a hole.
     fn pump(&mut self) {
         let (first, seq, exit, size) = (self.first, self.seq, self.exit, self.size);
-        let (ring, parser) = (&self.ring, &self.parser);
+        let (ring, parser, modes) = (&self.ring, &self.parser, &self.modes);
         for a in self.attachments.iter_mut() {
             if !a.started || a.peer.out.is_closed() {
                 continue;
             }
-            // Its next output was evicted. Once it has acknowledged everything sent, so the
+            // Its next event was evicted. Once it has acknowledged everything sent, so the
             // snapshot is of now and not of a moment it will never see, it gets one.
             if a.snapshot.is_empty()
                 && a.next < first
                 && a.next <= seq
                 && a.sender.unacked_bytes() == 0
             {
-                a.snapshot = snapshot_of(parser, size, seq, true);
+                a.snapshot = snapshot_of(parser, modes, size, seq, true);
                 a.next = seq + 1;
             }
             while let Some(part) = a.snapshot.front() {
@@ -208,21 +296,39 @@ impl Term {
                 continue;
             }
             while a.next >= first && a.next <= seq {
-                let chunk = &ring[(a.next - first) as usize];
-                let Ok(stream_seq) = a.sender.reserve(chunk.len() + EVENT_OVERHEAD) else {
+                let item = &ring[(a.next - first) as usize];
+                let Ok(stream_seq) = a.sender.reserve(item.bytes() + EVENT_OVERHEAD) else {
                     break;
                 };
-                let output = Output {
-                    seq: a.next,
-                    data: Chunk::new(chunk.clone()).unwrap_or_default(),
+                let frame = match item {
+                    Item::Output(data) => {
+                        let output = Output {
+                            seq: a.next,
+                            data: Chunk::new(data.clone()).unwrap_or_default(),
+                        };
+                        event_frame(
+                            &a.stream,
+                            stream_seq,
+                            pty::kind::OUTPUT,
+                            &output,
+                            a.peer.frame_limit,
+                        )
+                    }
+                    Item::Resized(size) => {
+                        let resized = Resized {
+                            seq: a.next,
+                            size: *size,
+                        };
+                        event_frame(
+                            &a.stream,
+                            stream_seq,
+                            pty::kind::RESIZED,
+                            &resized,
+                            a.peer.frame_limit,
+                        )
+                    }
                 };
-                if let Some(frame) = event_frame(
-                    &a.stream,
-                    stream_seq,
-                    pty::kind::OUTPUT,
-                    &output,
-                    a.peer.frame_limit,
-                ) {
+                if let Some(frame) = frame {
                     a.peer.out.event(frame);
                 }
                 a.next += 1;
@@ -247,6 +353,23 @@ impl Term {
         self.attachments.retain(|a| !a.peer.out.is_closed());
     }
 
+    /// Appends a numbered event and keeps this terminal's history within its own budget.
+    /// Returns the bytes added to and removed from the daemon-wide count.
+    fn push(&mut self, item: Item) -> (usize, usize) {
+        let added = item.bytes();
+        self.seq += 1;
+        self.ring.push_back(item);
+        self.ring_bytes += added;
+        let mut removed = 0;
+        while self.ring_bytes > self.ring_cap && self.ring.len() > 1 {
+            let gone = self.ring.pop_front().map(|i| i.bytes()).unwrap_or(0);
+            self.ring_bytes -= gone;
+            removed += gone;
+            self.first += 1;
+        }
+        (added, removed)
+    }
+
     fn signal(&self, signal: libc::c_int) {
         // Only a process group this daemon started and has not reaped: its id cannot have been
         // reused (the waiter reaps under the same lock, after recording the exit).
@@ -257,16 +380,33 @@ impl Term {
     }
 }
 
-/// The screen as of output `seq`, in parts of at most 64 KiB. On the alternate screen, the
-/// parts start by switching to it, so a reset terminal ends up there too (the main screen
-/// behind it is not part of a snapshot: the screen model keeps only what is shown).
-fn snapshot_of(parser: &vt100::Parser, size: Size, seq: u64, resync: bool) -> VecDeque<Snapshot> {
+/// The screen as of event `seq`, in parts of at most 64 KiB, as escape sequences that redraw
+/// it. On the alternate screen, the main screen comes first (contents, cursor, its keyboard
+/// flags), then the switch, then the alternate screen: leaving it later shows the right main
+/// screen. Then the modes the screen model does not keep: keyboard flags, focus reporting,
+/// cursor style.
+fn snapshot_of(
+    parser: &vt100::Parser,
+    modes: &Modes,
+    size: Size,
+    seq: u64,
+    resync: bool,
+) -> VecDeque<Snapshot> {
     let screen = parser.screen();
     let mut bytes = Vec::new();
     if screen.alternate_screen() {
+        let mut main = screen.clone();
+        let mut leave = vte::Parser::new();
+        for byte in b"\x1b[?1049l" {
+            leave.advance(&mut main, *byte);
+        }
+        bytes.extend_from_slice(&main.contents_formatted());
+        bytes.extend_from_slice(&main.cursor_state_formatted());
+        bytes.extend_from_slice(&modes.main_keyboard());
         bytes.extend_from_slice(b"\x1b[?1049h");
     }
     bytes.extend_from_slice(&screen.state_formatted());
+    bytes.extend_from_slice(&modes.restore());
     let parts: Vec<&[u8]> = bytes.chunks(MAX_CHUNK_BYTES).collect();
     let count = parts.len();
     parts
@@ -321,7 +461,7 @@ impl Terminals {
                 creates: DedupCache::new(CREATE_KEYS, CREATE_TTL_MS),
             }),
             epoch,
-            started: std::time::Instant::now(),
+            started: Instant::now(),
         })
     }
 
@@ -388,14 +528,13 @@ impl Terminals {
                 ring_cap,
                 first: 1,
                 parser: vt100::Parser::new(request.size.rows, request.size.cols, SCROLLBACK_ROWS),
-                lease: Some(Lease {
-                    key: lease.clone(),
-                    last_input: 0,
-                }),
+                modes: Modes::default(),
+                lease: Some(Lease::new(lease.clone())),
                 pending: VecDeque::new(),
                 eof: false,
                 status: None,
                 exit: None,
+                exited_at: None,
                 closing: false,
                 attachments: Vec::new(),
             },
@@ -429,7 +568,7 @@ impl Terminals {
         if request.after > term.seq {
             return Err(refuse_with(
                 ErrorCode::BadRequest,
-                "after is beyond this terminal's output",
+                "after is beyond this terminal's events",
             ));
         }
         let lease = match request.writer {
@@ -437,16 +576,27 @@ impl Terminals {
             Writer::Take => {
                 let key =
                     LeaseKey::from_bytes(random_bytes().map_err(|_| refuse(ErrorCode::Internal))?);
-                term.lease = Some(Lease {
-                    key: key.clone(),
-                    last_input: 0,
-                });
+                term.lease = Some(Lease::new(key.clone()));
+                // Whoever held it is told, and now only watches.
+                let seq = term.seq;
+                for a in term.attachments.iter_mut().filter(|a| a.holds_lease) {
+                    a.holds_lease = false;
+                    if let Ok(stream_seq) = a.sender.reserve(EVENT_OVERHEAD)
+                        && let Some(frame) = event_frame(
+                            &a.stream,
+                            stream_seq,
+                            pty::kind::LEASE_LOST,
+                            &LeaseLost { seq },
+                            a.peer.frame_limit,
+                        )
+                    {
+                        a.peer.out.event(frame);
+                    }
+                }
                 Some(key)
             }
-            Writer::Resume(key) => {
-                term.check_lease(&key)?;
-                Some(key)
-            }
+            // Taken by someone else meanwhile: attached all the same, watching only.
+            Writer::Resume(key) => term.check_lease(&key).ok().map(|()| key),
         };
         let replay = request.after + 1 >= term.first;
         let (mode, snapshot, next) = if replay {
@@ -463,6 +613,7 @@ impl Terminals {
             snapshot,
             exit_sent: false,
             started: false,
+            holds_lease: lease.is_some(),
         });
         Ok(Attached {
             stream,
@@ -471,25 +622,30 @@ impl Terminals {
             mode,
             seq: term.seq,
             lease,
-            exited: term.exit,
         })
     }
 
     pub fn start(&self, stream: &StreamId) {
         let mut state = self.lock();
-        for term in state.terms.values_mut() {
+        let mut found = None;
+        for (id, term) in state.terms.iter_mut() {
             if let Some(a) = term.attachments.iter_mut().find(|a| a.stream == *stream) {
                 a.started = true;
                 term.pump();
-                return;
+                found = Some(id.clone());
+                break;
             }
+        }
+        if let Some(id) = found {
+            state.reap(&id);
         }
     }
 
     /// Ok(false): not a terminal stream.
     pub fn ack(&self, peer: u64, ack: &Ack) -> Result<bool, WireError> {
         let mut state = self.lock();
-        for term in state.terms.values_mut() {
+        let mut found = None;
+        for (id, term) in state.terms.iter_mut() {
             if let Some(a) = term
                 .attachments
                 .iter_mut()
@@ -499,10 +655,17 @@ impl Terminals {
                     refuse_with(ErrorCode::BadFrame, "acknowledgment of an event never sent")
                 })?;
                 term.pump();
-                return Ok(true);
+                found = Some(id.clone());
+                break;
             }
         }
-        Ok(false)
+        match found {
+            Some(id) => {
+                state.reap(&id);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     pub fn detach(&self, peer: u64, request: &Detach) -> Result<(), WireError> {
@@ -512,6 +675,7 @@ impl Terminals {
             term.attachments
                 .retain(|a| !(a.stream == request.stream && a.peer.id == peer));
             if term.attachments.len() != before {
+                state.reap_all();
                 return Ok(());
             }
         }
@@ -524,6 +688,7 @@ impl Terminals {
         for term in state.terms.values_mut() {
             term.attachments.retain(|a| a.peer.id != peer);
         }
+        state.reap_all();
     }
 
     pub fn input(&self, request: Input) -> Result<InputOk, WireError> {
@@ -533,22 +698,31 @@ impl Terminals {
             .get_mut(&request.terminal)
             .ok_or_else(|| refuse(ErrorCode::NotFound))?;
         term.check_lease(&request.lease)?;
-        let last_input = term.lease.as_ref().map_or(0, |lease| lease.last_input);
-        if request.input_id <= last_input {
+        let Some(lease) = term.lease.as_ref() else {
+            return Err(refuse(ErrorCode::PermissionDenied));
+        };
+        if lease.seen.contains(&request.input_id) {
             return Ok(InputOk { duplicate: true });
+        }
+        if request.input_id <= lease.forgotten {
+            return Err(refuse_with(
+                ErrorCode::BadRequest,
+                "this input identifier is too old to tell whether it was typed",
+            ));
         }
         if term.eof || !term.alive() {
             return Err(refuse_with(ErrorCode::BadRequest, "the program has ended"));
         }
         let data = request.data.as_bytes();
         if term.pending.len() + data.len() > MAX_PENDING_INPUT {
+            // Not typed, not remembered: the same identifier can be retried.
             return Err(refuse_with(
                 ErrorCode::Busy,
                 "the program is not reading its input",
             ));
         }
         if let Some(lease) = term.lease.as_mut() {
-            lease.last_input = request.input_id;
+            lease.remember(request.input_id);
         }
         term.pending.extend(data);
         wake(&term.wake);
@@ -558,15 +732,27 @@ impl Terminals {
     pub fn resize(&self, request: Resize) -> Result<(), WireError> {
         request.size.validate()?;
         let mut state = self.lock();
-        let term = state
-            .terms
+        let State {
+            terms,
+            total_bytes,
+            total_cap,
+            ..
+        } = &mut *state;
+        let term = terms
             .get_mut(&request.terminal)
             .ok_or_else(|| refuse(ErrorCode::NotFound))?;
         term.check_lease(&request.lease)?;
-        // Serialized with output under the lock: a snapshot never mixes two sizes.
+        // Serialized with output under the lock, and numbered like it: every attachment applies
+        // the new size between the right bytes, and a snapshot never mixes two sizes.
         spawn::set_size(&term.master, request.size).map_err(|_| refuse(ErrorCode::Internal))?;
         term.parser.set_size(request.size.rows, request.size.cols);
         term.size = request.size;
+        let (added, removed) = term.push(Item::Resized(request.size));
+        *total_bytes = *total_bytes + added - removed;
+        Self::trim(terms, total_bytes, *total_cap);
+        for term in terms.values_mut() {
+            term.pump();
+        }
         Ok(())
     }
 
@@ -589,6 +775,8 @@ impl Terminals {
         Ok(())
     }
 
+    /// Hang-up, then kill after a grace period; the terminal goes once every attachment received
+    /// its last bytes and its exit (or after CLOSED_LINGER, so a stalled watcher cannot keep it).
     pub fn close(self: &Arc<Self>, request: Close) -> Result<(), WireError> {
         let mut state = self.lock();
         let term = state
@@ -597,18 +785,25 @@ impl Terminals {
             .ok_or_else(|| refuse(ErrorCode::NotFound))?;
         term.check_lease(&request.lease)?;
         term.closing = true;
-        if term.exit.is_some() {
-            state.terms.remove(&request.terminal);
-            return Ok(());
-        }
         term.signal(libc::SIGHUP);
+        state.reap(&request.terminal);
+        drop(state);
         let this = self.clone();
         let id = request.terminal;
         std::thread::spawn(move || {
             std::thread::sleep(CLOSE_GRACE);
-            let state = this.lock();
-            if let Some(term) = state.terms.get(&id) {
+            if let Some(term) = this.lock().terms.get(&id) {
                 term.signal(libc::SIGKILL);
+            }
+            let deadline = Instant::now() + CLOSED_LINGER + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                let mut state = this.lock();
+                state.reap(&id);
+                if !state.terms.contains_key(&id) {
+                    return;
+                }
+                drop(state);
+                std::thread::sleep(Duration::from_millis(500));
             }
         });
         Ok(())
@@ -641,6 +836,23 @@ impl Terminals {
         }
     }
 
+    /// Across terminals: the largest history gives way first.
+    fn trim(terms: &mut HashMap<TerminalId, Term>, total_bytes: &mut usize, total_cap: usize) {
+        while *total_bytes > total_cap {
+            let Some(largest) = terms
+                .values_mut()
+                .filter(|t| t.ring.len() > 1)
+                .max_by_key(|t| t.ring_bytes)
+            else {
+                break;
+            };
+            let gone = largest.ring.pop_front().map(|i| i.bytes()).unwrap_or(0);
+            largest.ring_bytes -= gone;
+            *total_bytes -= gone;
+            largest.first += 1;
+        }
+    }
+
     fn output(&self, terminal: &TerminalId, bytes: &[u8]) {
         let mut state = self.lock();
         let State {
@@ -652,34 +864,15 @@ impl Terminals {
         let Some(term) = terms.get_mut(terminal) else {
             return;
         };
-        term.seq += 1;
         term.parser.process(bytes);
-        term.ring.push_back(bytes.to_vec());
-        term.ring_bytes += bytes.len();
-        *total_bytes += bytes.len();
-        while term.ring_bytes > term.ring_cap && term.ring.len() > 1 {
-            let gone = term.ring.pop_front().map(|c| c.len()).unwrap_or(0);
-            term.ring_bytes -= gone;
-            *total_bytes -= gone;
-            term.first += 1;
-        }
-        // Across terminals: the largest history gives way first.
-        while *total_bytes > *total_cap {
-            let Some(largest) = terms
-                .values_mut()
-                .filter(|t| t.ring.len() > 1)
-                .max_by_key(|t| t.ring_bytes)
-            else {
-                break;
-            };
-            let gone = largest.ring.pop_front().map(|c| c.len()).unwrap_or(0);
-            largest.ring_bytes -= gone;
-            *total_bytes -= gone;
-            largest.first += 1;
-        }
+        term.modes.feed(bytes);
+        let (added, removed) = term.push(Item::Output(bytes.to_vec()));
+        *total_bytes = *total_bytes + added - removed;
+        Self::trim(terms, total_bytes, *total_cap);
         for term in terms.values_mut() {
             term.pump();
         }
+        state.reap_all();
     }
 
     fn finish_if_ended(state: &mut State, terminal: &TerminalId) {
@@ -692,10 +885,9 @@ impl Terminals {
                 code,
                 signal,
             });
+            term.exited_at = Some(Instant::now());
             term.pump();
-            if term.closing {
-                state.terms.remove(terminal);
-            }
+            state.reap(terminal);
         }
     }
 

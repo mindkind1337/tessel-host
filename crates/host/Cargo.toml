@@ -14,6 +14,9 @@ sha2 = "0.10"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 vt100 = "0.15"
+# The same parser vt100 uses: it drives a copy of the screen to read the main screen behind
+# the alternate one.
+vte = "0.11"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

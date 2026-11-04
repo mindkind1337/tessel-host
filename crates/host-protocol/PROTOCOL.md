@@ -140,18 +140,25 @@ Requests and their replies (`src/pty.rs` has every field):
 - `create` carries a deduplication key: a retry returns the first terminal. `argv` empty starts
   the user's login shell; `env` is added to a small base (HOME, USER, LOGNAME, SHELL, PATH, LANG,
   LC_*, TZ, and TERM defaulting to `xterm-256color`). At most 64 terminals.
-- Output is numbered by the terminal (`seq`, from 1, one number per chunk of up to 64 KiB). An
+- A terminal's events are numbered (`seq`, from 1): `terminal.output` (a chunk of up to 64 KiB)
+  and `terminal.resized` (the new size, between the right bytes, sent to every attachment). An
   attachment names the last `seq` the client applied (`after`). If what follows is still kept,
-  the reply says `replay` and those chunks come as `terminal.output` events; otherwise it says
-  `snapshot`: `terminal.snapshot` events at the barrier `seq` come first, then output after it.
-  Either way no chunk arrives twice and none is skipped silently.
-- A snapshot redraws the screen (contents, colours, cursor, input modes, title, and the switch to
-  the alternate screen when it is shown) without replaying what produced it, so no clipboard
-  write, bell or reply to the program happens again. Not in a snapshot: the main screen behind
-  an alternate screen, and scrollback.
+  the reply says `replay` and those events follow; otherwise it says `snapshot`:
+  `terminal.snapshot` events at the barrier `seq` come first, then what follows it. Either way no
+  event arrives twice and none is skipped silently.
+- `terminal.exit` comes once per attachment, after every event up to its `seq`: show the end
+  when it arrives (the attach reply does not carry it).
+- A snapshot redraws the screen without replaying what produced it, so no clipboard write, bell
+  or reply to the program happens again. It holds the screen contents, colours, cursor, input
+  modes (bracketed paste, mouse, application keys) and title; on the alternate screen, the main
+  screen behind it first, then the switch, so leaving the alternate screen shows the right main
+  screen; and the modes the screen model does not keep, followed from the output: the kitty
+  keyboard flags of each screen (`CSI > u`, so Shift+Enter stays a new line in programs that use
+  it), focus reporting and the cursor style. Not in a snapshot: scrollback. A client keeps its own
+  scrollback and applies the snapshot to the visible screen.
 - Each terminal keeps at most the `terminal_ring_bytes` of the connection that created it; all
   terminals together at most the daemon's `total_ring_bytes`, the largest history giving way
-  first. History, never the program, is what is dropped. An attachment whose next chunk was
+  first. History, never the program, is what is dropped. An attachment whose next event was
   dropped before it read it gets a snapshot with `resync: true` once it has acknowledged what it
   was sent.
 - Events of an attachment count against its `stream_window_bytes` until acknowledged, so a slow
@@ -159,10 +166,19 @@ Requests and their replies (`src/pty.rs` has every field):
 - `attach` names the host epoch the client knew; another one is refused with `epoch_mismatch`
   (the daemon restarted, its terminals are gone). An unknown terminal is `not_found`.
 - The lease: one holder at a time, needed to type, resize, signal and close. `writer: "take"`
-  takes it from whoever held it; `{"resume": lease}` keeps it across a reconnect; `"none"`
-  only watches. `input_id` goes up for each lease: one already applied is not typed again and
-  the reply says `duplicate: true`, so a retry after a lost reply is safe. Input waiting for the
-  program to read it is limited to 1 MiB (`busy`).
+  takes it, and every attachment that held it gets `terminal.lease_lost` and only watches from
+  then on. `{"resume": lease}` keeps it across a reconnect; if someone took it meanwhile, the
+  attachment is made all the same, watching only, and its reply carries no lease. `"none"` only
+  watches.
+- Each `input_id` is typed at most once per lease: a retry of one already applied (after a lost
+  reply) is answered `duplicate: true` and not typed again; one refused as `busy` (input waiting
+  for the program is limited to 1 MiB) is not remembered and can be retried, even after later
+  ones went through. The last 1024 applied identifiers are remembered; an older one is refused
+  (`bad_request`) rather than guessed.
+- `close` hangs up the process group, kills it 3 seconds later if needed, and forgets the
+  terminal once every attachment received its last events and its exit (at most 60 seconds after
+  the exit, so a stalled watcher cannot keep it). Its history then stops counting against the
+  daemon's budget.
 - Terminals need a frame budget of at least 96 KiB (a 64 KiB chunk in base64 with its envelope);
   below that, `create` and `attach` are refused with `bad_request`.
 
@@ -290,6 +306,8 @@ A client reads a code it does not know as `unknown`.
 | `terminal.attach` with another epoch | after hello | reply `epoch_mismatch` |
 | `terminal.input` without the lease | after hello | reply `permission_denied` |
 | `terminal.input` with an `input_id` already applied | after hello | `duplicate: true`, not typed |
+| `terminal.input` retrying one refused as `busy` | after hello | typed (or `busy` again), never `duplicate` |
+| `terminal.attach` resuming a lease taken meanwhile | after hello | attached, watching, no lease in the reply |
 | `terminal.create` or `attach` under a 96 KiB frame budget | after hello | reply `bad_request` |
 | `tree.expand` through a symbolic link | after hello | reply `bad_request` |
 | `tree.expand` of an unreadable directory | after hello | reply `permission_denied` |

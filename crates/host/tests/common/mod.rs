@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
-use tessel_host_protocol::pty::{self, Exit, Output, Snapshot};
+use tessel_host_protocol::pty::{self, Exit, Output, Resized, Snapshot};
 use tessel_host_protocol::*;
 
 pub const EXE: &str = env!("CARGO_BIN_EXE_tessel-host");
@@ -235,6 +235,10 @@ pub struct Viewer {
     parts: Vec<Snapshot>,
     pub snapshots: Vec<Snapshot>,
     pub exit: Option<Exit>,
+    pub exits: usize,
+    pub resized: Vec<Resized>,
+    pub lease_lost: usize,
+    pub snapshot_bytes: Vec<u8>,
     pub acking: bool,
     pub last_stream_seq: u64,
 }
@@ -250,6 +254,10 @@ impl Viewer {
             parts: Vec::new(),
             snapshots: Vec::new(),
             exit: None,
+            exits: 0,
+            resized: Vec::new(),
+            lease_lost: 0,
+            snapshot_bytes: Vec::new(),
             acking: true,
             last_stream_seq: 0,
         }
@@ -296,8 +304,10 @@ impl Viewer {
                     let parts = std::mem::take(&mut self.parts);
                     let first = &parts[0];
                     self.screen = vt100::Parser::new(first.size.rows, first.size.cols, 0);
+                    self.snapshot_bytes.clear();
                     for p in &parts {
                         self.screen.process(p.data.as_bytes());
+                        self.snapshot_bytes.extend_from_slice(p.data.as_bytes());
                     }
                     assert!(first.at >= self.last, "a snapshot never goes back");
                     self.last = first.at;
@@ -308,7 +318,20 @@ impl Viewer {
                 let exit: Exit = event.body_as().unwrap();
                 assert_eq!(exit.seq, self.last);
                 self.exit = Some(exit);
+                self.exits += 1;
             }
+            pty::kind::RESIZED => {
+                let resized: Resized = event.body_as().unwrap();
+                assert_eq!(
+                    resized.seq,
+                    self.last + 1,
+                    "a resize is numbered with the output"
+                );
+                self.last = resized.seq;
+                self.screen.set_size(resized.size.rows, resized.size.cols);
+                self.resized.push(resized);
+            }
+            pty::kind::LEASE_LOST => self.lease_lost += 1,
             other => panic!("unexpected event {other}"),
         }
         if self.acking {

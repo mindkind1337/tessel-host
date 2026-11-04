@@ -37,6 +37,8 @@ pub mod kind {
     pub const OUTPUT: &str = "terminal.output";
     pub const SNAPSHOT: &str = "terminal.snapshot";
     pub const EXIT: &str = "terminal.exit";
+    pub const RESIZED: &str = "terminal.resized";
+    pub const LEASE_LOST: &str = "terminal.lease_lost";
 }
 
 fn bad(detail: &'static str) -> WireError {
@@ -161,16 +163,19 @@ pub struct Attached {
     pub pid: u32,
     pub size: Size,
     pub mode: AttachMode,
-    /// The sequence barrier: the last output when the attachment started.
+    /// The sequence barrier: the last event when the attachment started.
     pub seq: u64,
+    /// The lease this attachment holds: given for `take`, and for `resume` while the lease is
+    /// still that one. A lease taken by someone else meanwhile gives none: the attachment only
+    /// watches (and says so), it is not refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exited: Option<Exit>,
 }
 
-/// Bytes to type. `input_id` goes up for each lease: one already applied is not written again
-/// (a retry after a lost reply), and the reply says so.
+/// Bytes to type. Each `input_id` is typed at most once per lease: a retry of one already
+/// applied (after a lost reply) is not typed again and the reply says so; one refused (`busy`)
+/// can be retried. The last 1024 applied identifiers are remembered: an older one is refused
+/// rather than guessed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
@@ -278,7 +283,8 @@ pub struct Snapshot {
     pub data: Chunk,
 }
 
-/// Event (and part of `attached` / `listed`): the program ended; `seq` is its last output.
+/// Event (and part of `listed`): the program ended; `seq` is its last event. It comes once per
+/// attachment, after every event up to `seq`: show the end when it arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Exit {
@@ -287,4 +293,19 @@ pub struct Exit {
     pub code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<i32>,
+}
+
+/// Event: the terminal was resized, numbered like output so it applies between the right bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resized {
+    pub seq: u64,
+    pub size: Size,
+}
+
+/// Event: another client took the lease this attachment held; it now only watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseLost {
+    pub seq: u64,
 }

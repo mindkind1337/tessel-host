@@ -304,9 +304,10 @@ fn an_exit_while_nobody_watches_is_kept_for_the_next_attachment() {
     assert_eq!(info.exited.map(|e| e.code), Some(Some(7)));
     assert!(listed.retained_bytes >= 5 && listed.daemon_rss_bytes > 0);
     let mut viewer = Viewer::new();
-    let attached = attach(&mut client, &mut viewer, &created.terminal, 0, Writer::None);
-    assert_eq!(attached.exited.map(|e| e.code), Some(Some(7)));
+    attach(&mut client, &mut viewer, &created.terminal, 0, Writer::None);
     viewer.until(&mut client, |v| v.exit.is_some());
+    viewer.drain(&mut client, Duration::from_millis(300));
+    assert_eq!(viewer.exits, 1, "the end comes once, after the output");
     assert_eq!(viewer.text(), "bye\r\n");
     assert_eq!(viewer.exit.unwrap().code, Some(7));
 }
@@ -414,4 +415,281 @@ fn a_small_frame_budget_is_refused_for_terminals() {
         )
         .unwrap_err();
     assert_eq!(refused.code, ErrorCode::BadRequest);
+}
+
+// Franklin's review of gate 3, one test per point.
+
+#[test]
+fn a_busy_input_retried_after_a_later_one_is_typed_is_never_taken_for_a_duplicate() {
+    let mut home = Home::new("busyretry");
+    let mut client = home.client(Budgets::SLOW_HOST);
+    // A program that never reads: input piles up until it is refused as busy.
+    let created = create(&mut client, 20, sh("sleep 60"), SIZE);
+    let big = "x".repeat(60_000);
+    let mut id = 0;
+    let busy_id = loop {
+        id += 1;
+        match input(&mut client, &created.terminal, &created.lease, id, &big) {
+            Ok(ok) => assert!(!ok.duplicate),
+            Err(error) => {
+                assert_eq!(error.code, ErrorCode::Busy);
+                break id;
+            }
+        }
+        assert!(id < 40, "never busy");
+    };
+    // A later, small one fits. The refused one, retried, is refused again or typed now, but
+    // never answered "already typed" (it was not).
+    assert!(
+        !input(
+            &mut client,
+            &created.terminal,
+            &created.lease,
+            busy_id + 1,
+            "y"
+        )
+        .unwrap()
+        .duplicate
+    );
+    match input(
+        &mut client,
+        &created.terminal,
+        &created.lease,
+        busy_id,
+        &big,
+    ) {
+        Err(error) => assert_eq!(error.code, ErrorCode::Busy),
+        Ok(ok) => assert!(!ok.duplicate, "a refused input taken for a duplicate"),
+    }
+    assert!(
+        input(
+            &mut client,
+            &created.terminal,
+            &created.lease,
+            busy_id + 1,
+            "y"
+        )
+        .unwrap()
+        .duplicate
+    );
+}
+
+#[test]
+fn an_input_identifier_older_than_the_window_is_refused_not_guessed() {
+    let mut home = Home::new("window");
+    let mut client = home.client(Budgets::SLOW_HOST);
+    let created = create(&mut client, 21, vec!["cat".into()], SIZE);
+    for id in 1..=1100 {
+        input(&mut client, &created.terminal, &created.lease, id, "a").unwrap();
+    }
+    assert!(
+        input(&mut client, &created.terminal, &created.lease, 1100, "a")
+            .unwrap()
+            .duplicate
+    );
+    assert_eq!(
+        input(&mut client, &created.terminal, &created.lease, 3, "a")
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
+    );
+}
+
+#[test]
+fn a_closed_terminal_gives_its_history_back_to_the_daemon_budget() {
+    let mut home = Home::new("budget");
+    let mut client = home.client(Budgets::SLOW_HOST);
+    let created = create(
+        &mut client,
+        22,
+        sh("head -c 50000 /dev/zero | tr '\\0' z; sleep 60"),
+        SIZE,
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let before: Listed = client.ask(kind::LIST, &serde_json::Value::Null);
+    assert!(before.retained_bytes >= 50_000);
+    client.ask::<serde_json::Value>(
+        kind::CLOSE,
+        &Close {
+            terminal: created.terminal.clone(),
+            lease: created.lease.clone(),
+        },
+    );
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let listed: Listed = client.ask(kind::LIST, &serde_json::Value::Null);
+        if listed.terminals.is_empty() {
+            assert_eq!(
+                listed.retained_bytes, 0,
+                "nothing still counted for a terminal that is gone"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn closing_waits_for_a_slow_watcher_to_get_the_last_bytes_and_the_end() {
+    let mut home = Home::new("closeslow");
+    let budgets = Budgets {
+        frame_bytes: 98_304,
+        stream_window_bytes: 98_304,
+        ..Budgets::SLOW_HOST
+    };
+    let mut writer = home.client(Budgets::SLOW_HOST);
+    let created = create(
+        &mut writer,
+        23,
+        sh("head -c 400000 /dev/zero | tr '\\0' w; sleep 60"),
+        SIZE,
+    );
+    let mut watcher = home.client(budgets);
+    let mut slow = Viewer::new();
+    slow.acking = false;
+    attach(&mut watcher, &mut slow, &created.terminal, 0, Writer::None);
+    std::thread::sleep(Duration::from_millis(800));
+    writer.ask::<serde_json::Value>(
+        kind::CLOSE,
+        &Close {
+            terminal: created.terminal.clone(),
+            lease: created.lease.clone(),
+        },
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    // The watcher catches up afterwards: every byte, then the end, then the terminal goes.
+    slow.drain(&mut watcher, Duration::from_millis(200));
+    slow.acking = true;
+    let stream = slow.stream.clone().unwrap();
+    watcher.ack(&stream, slow.last_stream_seq);
+    slow.until(&mut watcher, |v| v.exit.is_some());
+    assert_eq!(
+        slow.text.iter().filter(|&&b| b == b'w').count(),
+        400_000,
+        "every byte reached the slow watcher"
+    );
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let listed: Listed = writer.ask(kind::LIST, &serde_json::Value::Null);
+        if listed.terminals.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the closed terminal stayed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn whoever_loses_the_lease_is_told_and_a_stale_resume_only_watches() {
+    let mut home = Home::new("leaselost");
+    let mut a = home.client(Budgets::SLOW_HOST);
+    let created = create(&mut a, 24, vec!["cat".into()], SIZE);
+    let mut view_a = Viewer::new();
+    attach(
+        &mut a,
+        &mut view_a,
+        &created.terminal,
+        0,
+        Writer::Resume(created.lease.clone()),
+    );
+    let mut b = home.client(Budgets::SLOW_HOST);
+    let mut view_b = Viewer::new();
+    let taken = attach(&mut b, &mut view_b, &created.terminal, 0, Writer::Take);
+    assert!(taken.lease.is_some());
+    view_a.until(&mut a, |v| v.lease_lost == 1);
+    // A reconnects with its old lease: attached, watching, told by `lease: None`.
+    a.kill();
+    let mut a = home.client(Budgets::SLOW_HOST);
+    let mut again = Viewer::new();
+    let resumed = attach(
+        &mut a,
+        &mut again,
+        &created.terminal,
+        0,
+        Writer::Resume(created.lease.clone()),
+    );
+    assert!(resumed.lease.is_none());
+}
+
+#[test]
+fn a_resize_reaches_every_watcher_between_the_right_bytes() {
+    let mut home = Home::new("resizeall");
+    let mut owner = home.client(Budgets::SLOW_HOST);
+    let created = create(&mut owner, 25, vec!["/bin/sh".into()], SIZE);
+    let mut watcher = home.client(Budgets::SLOW_HOST);
+    let mut view = Viewer::new();
+    attach(&mut watcher, &mut view, &created.terminal, 0, Writer::None);
+    let size = Size {
+        rows: 30,
+        cols: 120,
+    };
+    owner.ask::<serde_json::Value>(
+        kind::RESIZE,
+        &Resize {
+            terminal: created.terminal.clone(),
+            lease: created.lease.clone(),
+            size,
+        },
+    );
+    input(
+        &mut owner,
+        &created.terminal,
+        &created.lease,
+        1,
+        "stty size\n",
+    )
+    .unwrap();
+    view.until(&mut watcher, |v| v.text().contains("30 120"));
+    assert_eq!(view.resized.len(), 1);
+    assert_eq!(view.resized[0].size, size);
+    assert_eq!(view.screen.screen().size(), (30, 120));
+}
+
+#[test]
+fn a_snapshot_keeps_the_main_screen_behind_the_alternate_one_and_the_keyboard_modes() {
+    let mut home = Home::new("kitty");
+    let budgets = Budgets {
+        terminal_ring_bytes: 1024,
+        ..Budgets::SLOW_HOST
+    };
+    let mut client = home.client(budgets);
+    let script = "printf 'MAIN-SCREEN-TEXT\\033[>1u'; sleep 0.2; printf '\\033[?1049h\\033[2J\\033[HALT-TEXT\\033[>3u\\033[?1004h\\033[5 q'; sleep 0.2; for i in $(seq 1 600); do printf '\\033[10;1H'; done; sleep 60";
+    let created = create(&mut client, 26, sh(script), SIZE);
+    std::thread::sleep(Duration::from_millis(1200));
+    let mut viewer = Viewer::new();
+    let attached = attach(&mut client, &mut viewer, &created.terminal, 0, Writer::None);
+    assert_eq!(attached.mode, AttachMode::Snapshot);
+    viewer.until(&mut client, |v| !v.snapshots.is_empty());
+    let data = viewer.snapshot_bytes.clone();
+    let find = |needle: &[u8]| data.windows(needle.len()).position(|w| w == needle);
+    let switch = find(b"\x1b[?1049h").expect("the switch to the alternate screen");
+    assert!(
+        find(b"\x1b[>1u").is_some_and(|at| at < switch),
+        "the main screen's keyboard flags, before the switch"
+    );
+    assert!(
+        find(b"\x1b[>3u").is_some_and(|at| at > switch),
+        "the alternate screen's keyboard flags, after it"
+    );
+    assert!(
+        find(b"\x1b[?1004h").is_some() && find(b"\x1b[5 q").is_some(),
+        "focus reporting and cursor style"
+    );
+    assert!(viewer.screen.screen().alternate_screen());
+    assert!(viewer.screen.screen().contents().contains("ALT-TEXT"));
+    // Leaving the alternate screen shows the main screen as it was, not an empty one.
+    viewer.screen.process(b"\x1b[?1049l");
+    assert!(
+        viewer
+            .screen
+            .screen()
+            .contents()
+            .contains("MAIN-SCREEN-TEXT"),
+        "{}",
+        viewer.screen.screen().contents()
+    );
 }

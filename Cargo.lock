@@ -185,6 +185,7 @@ dependencies = [
  "sha2",
  "tessel-host-protocol",
  "vt100",
+ "vte",
 ]
 
 [[package]]
