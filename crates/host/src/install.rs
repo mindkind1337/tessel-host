@@ -49,7 +49,7 @@ pub struct Artifact {
     pub sha256: String,
 }
 
-/// `manifest.json` of a release, made by `scripts/host-release.sh`.
+/// `manifest.json` of a release, made by `cargo run -p tessel-host-xtask -- release`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {

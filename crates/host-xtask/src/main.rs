@@ -109,6 +109,10 @@ fn release(out: &Path) -> Result<()> {
         .map(|a| format!("{}  {}\n", a.sha256, a.file))
         .collect();
     std::fs::write(out.join("SHA256SUMS"), sums).map_err(|e| e.to_string())?;
+    // The licence travels with the programs.
+    let licence = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../LICENSE");
+    std::fs::copy(&licence, out.join("LICENSE"))
+        .map_err(|e| format!("{}: {e}", licence.display()))?;
     for a in &manifest.artifacts {
         println!(
             "{}  {} ({} bytes, static, {})",
