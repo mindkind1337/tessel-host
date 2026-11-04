@@ -183,9 +183,21 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tessel-host-client",
  "tessel-host-protocol",
  "vt100",
  "vte",
+]
+
+[[package]]
+name = "tessel-host-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tessel-host-protocol",
 ]
 
 [[package]]

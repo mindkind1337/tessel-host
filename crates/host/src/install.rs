@@ -108,6 +108,11 @@ pub fn matches(artifact: &Artifact, bytes: &[u8]) -> bool {
 /// compares what `digest` prints with the manifest (`parse_digest`) and runs `activate` only if
 /// they are the same, `abort` otherwise. `activate` ends by running the installed program's
 /// `version`, which the client checks (`check_version`) before attaching.
+///
+/// Every field is a complete shell command for the exec channel, to be passed as it is: paths
+/// in them use `$HOME` inside double quotes so the host's shell expands it. A client never
+/// builds a path or a command itself: `version` and `connect` are the commands to check and to
+/// reach the installed program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub probe: String,
@@ -115,7 +120,13 @@ pub struct Plan {
     pub digest: String,
     pub activate: String,
     pub abort: String,
+    /// The installed program's path as a shell expression (`$HOME/...`), for display; use the
+    /// commands below to run it.
     pub installed: String,
+    /// Prints the installed program's version line (check it with `check_version`).
+    pub version: String,
+    /// What the SSH channel of a connection runs.
+    pub connect: String,
 }
 
 const DIRS: [&str; 3] = [
@@ -154,8 +165,15 @@ pub fn plan(version: &str, arch: Arch, nonce: &str) -> Option<Plan> {
             "chmod 700 \"{part}\" && mv -f \"{part}\" \"{installed}\" && \"{installed}\" version"
         ),
         abort: format!("rm -f \"{part}\""),
+        version: format!("\"{installed}\" version"),
+        connect: format!("\"{installed}\" connect --stdio"),
         installed,
     })
+}
+
+/// The commands to check and reach an installed version without a nonce (no upload planned).
+pub fn commands(version: &str, arch: Arch) -> Option<(String, String)> {
+    plan(version, arch, "0000000000000000").map(|p| (p.version, p.connect))
 }
 
 /// The digest at the start of `sha256sum`'s output.

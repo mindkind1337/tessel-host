@@ -14,7 +14,15 @@ versions of Tessel and has its own releases.
   channel runs: it starts the daemon when needed and relays bytes. Losing the connection never
   stops the daemon. `install` is the client side of putting the program on a host with the exec
   channel it already has (`cat`, `sha256sum`, `chmod`, `mv`: no curl, sudo or package manager).
+- `crates/host-client`: the client library for the desktop (builds on Windows): one link over any
+  byte stream (`CommandConnector` runs e.g. `ssh host <installed> connect --stdio`), reconnection
+  with resumed sessions on the same daemon and an explicit state on a restarted one, and typed
+  sessions for terminals, file trees, the editor and git.
 - `crates/host-xtask`: builds and checks releases.
+- [GUIDE-CLIENT.md](GUIDE-CLIENT.md): the exact sequences a desktop implements, installation,
+  degraded states and the editor's dirty buffer across a reconnect included.
+- `fixtures/sessions/`: recorded sessions with a real daemon (terminal, tree, editor, git), one
+  frame per line, for clients in other languages to replay; checked on every CI run.
 - [HOST_PROTOCOL_PLAN.md](HOST_PROTOCOL_PLAN.md): the plan, its acceptance gates and the evidence
   for each.
 
@@ -24,7 +32,8 @@ Gates 1 (protocol), 2 (daemon, bridge, rootless installer, static builds) , 3 (t
 outlive the connection, with replay or a snapshot on reattach), 4 (file trees kept current
 with inotify, from a cache), 5 (the editor: chunked reads, saves that never overwrite a
 change silently) and 6 (git status kept current from file events, one bounded low-priority git
-at a time) are done. Desktop integration follows. Nothing here replaces
+at a time) are done; for gate 7 the client library, its guide and the cross-client fixtures are
+done, and the desktop integration (in the Rust desktop) follows. Nothing here replaces
 tmux or the JavaScript helper on a host yet.
 
 ## Build and test (Linux)

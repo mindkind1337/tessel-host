@@ -40,6 +40,18 @@ jobs:
       - name: Longer protocol fuzzing (release)
         run: TESSEL_FUZZ_ITERATIONS=200000 cargo test --locked --release -p tessel-host-protocol --test fuzz
 
+  windows:
+    name: Windows (the desktop side)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: The protocol, the client and the installer build and pass on Windows
+        run: |
+          cargo clippy --locked -p tessel-host-protocol -p tessel-host-client -p tessel-host --all-targets -- -D warnings
+          cargo test --locked -p tessel-host-protocol -p tessel-host-client -p tessel-host
+
   release:
     name: Static musl programs (x86_64, aarch64)
     runs-on: ubuntu-24.04

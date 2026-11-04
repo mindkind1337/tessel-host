@@ -15,8 +15,25 @@ fn hex32(value: &str) -> bool {
 
 macro_rules! token {
     ($(#[$doc:meta])* $name:ident, $what:literal) => {
+        token!(@define $(#[$doc])* $name, $what);
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.0).finish()
+            }
+        }
+    };
+    // A capability: its value never appears in Debug output (logs, panics, traces).
+    (secret $(#[$doc:meta])* $name:ident, $what:literal) => {
+        token!(@define $(#[$doc])* $name, $what);
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!(stringify!($name), "(<hidden>)"))
+            }
+        }
+    };
+    (@define $(#[$doc:meta])* $name:ident, $what:literal) => {
         $(#[$doc])*
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -71,6 +88,7 @@ token!(
     "terminal id"
 );
 token!(
+    secret
     /// The right to type into, resize, signal and close one terminal. One holder at a time;
     /// attaching alone does not give it. Kept across reconnects so a client can resume it.
     LeaseKey,

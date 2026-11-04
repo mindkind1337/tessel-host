@@ -19,4 +19,5 @@ vt100 = "0.15"
 vte = "0.11"
 
 [dev-dependencies]
+tessel-host-client = { path = "../host-client" }
 serde = { version = "1", features = ["derive"] }

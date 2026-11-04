@@ -157,6 +157,19 @@ mod on_linux {
             std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        // The generated commands reach it as they are, $HOME expanded by the host's shell.
+        let (version, connect) = commands(tessel_host::VERSION, arch).unwrap();
+        assert_eq!(
+            (version.clone(), connect.clone()),
+            (plan.version.clone(), plan.connect.clone())
+        );
+        let printed = sh(&home, &version, b"");
+        assert!(check_version(
+            &String::from_utf8_lossy(&printed.stdout),
+            tessel_host::VERSION,
+            arch
+        ));
+        assert!(connect.ends_with(" connect --stdio") && !connect.contains('\''));
         assert_eq!(
             std::fs::metadata(home.join(".tessel-server/host/bin"))
                 .unwrap()

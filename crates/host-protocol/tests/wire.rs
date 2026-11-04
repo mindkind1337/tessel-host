@@ -690,3 +690,20 @@ fn roots_are_admitted_by_the_tree_or_the_editor_capability() {
         Err(ErrorCode::UnsupportedKind)
     );
 }
+
+#[test]
+fn a_lease_never_shows_in_debug_output() {
+    let lease = LeaseKey::from_bytes([0xab; 16]);
+    let shown = format!("{lease:?} {:?}", Some(lease.clone()));
+    assert!(!shown.contains("abab"), "{shown}");
+    assert_eq!(format!("{lease:?}"), "LeaseKey(<hidden>)");
+    // Still sent as it is on the wire.
+    assert_eq!(
+        serde_json::to_value(&lease).unwrap(),
+        serde_json::json!("ab".repeat(16))
+    );
+    assert!(
+        format!("{:?}", StreamId::from_bytes([0xab; 16])).contains("abab"),
+        "identifiers that are not capabilities stay visible"
+    );
+}

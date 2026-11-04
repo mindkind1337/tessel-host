@@ -1,6 +1,6 @@
 # Native remote host plan
 
-Status: gates 1 to 6 implemented (below); gate 7 to come. Target: Linux
+Status: gates 1 to 6 implemented (below); gate 7: the host side done, the desktop side in progress. Target: Linux
 x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
 No changes to the running Electron checkout. This is part of full Tessel parity,
 not a replacement for the remaining desktop work.
@@ -188,6 +188,37 @@ measured: the production host (its disk and load made the old status take
 about 30 s there; never benchmarked there without a separate request), a
 repository whose untracked files sit individually in tracked directories beyond
 50,000 (it is reported truncated), network file systems.
+
+Gate 7, host side (split by Darwin: the client library, its guide and the
+fixtures here; the desktop panels, the first-connection installer, the visible
+SFTP fallback and moving sessions off tmux in tessel-rust): `crates/host-client`
+keeps one link over any byte stream a Connector opens (`CommandConnector` runs
+a command such as ssh), matches replies, routes stream events (events of a
+stream not claimed yet are kept and delivered first, in order), and
+acknowledges an event only when the application has taken it, so the host's
+window holds a slow consumer back end to end. A supervisor reopens the link
+with back-off; on the same epoch every session resumes (terminals reattach
+after their last applied event with their lease, trees subscribe and relist
+expanded folders, git subscribes and resets), on another epoch the state says
+Restarted, terminals report Lost, and trees, editors and git reopen by path.
+Terminal input is numbered by the client and retried with the same number
+through busy answers and reconnects; an editor save cut by a broken link is
+sent again whole against the same base; conflicts and full disks are their own
+answers. `GUIDE-CLIENT.md` gives the exact desktop sequences (installation,
+states, terminals, trees, the editor and its dirty buffer on reconnect, git,
+fallback). `fixtures/sessions/` holds four sessions recorded from a real daemon
+with run-dependent values made stable; a protocol test checks every frame,
+identifier order, one reply per request and gapless stream numbering. CI gains
+a Windows job (Clippy and tests of the protocol, the client and the installer).
+Evidence (Ubuntu 24.04 WSL), 3 client tests over the real bridge, three runs:
+the bridge SIGKILLed mid-output, then Disconnected, Reattached (replay, lease
+kept), the same epoch and 3,000 numbered lines exactly, input typed once after
+the reconnect; the daemon SIGKILLed, then Restarted with the old and new
+epochs, the terminal Lost, the tree relisted after reopening its root and git
+reset; an editor save sent after the link was cut succeeding once reconnected,
+and a conflict refused with the host's file untouched. Not verified: Windows
+at run time (CI checks it builds and its unit tests pass), a real SSH client
+as the connector inside the desktop, and the desktop panels themselves.
 
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both

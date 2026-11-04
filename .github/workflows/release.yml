@@ -1,0 +1,39 @@
+name: Release
+
+# A tag v<version> (the tessel-host crate's version) publishes the static programs, their
+# manifest, SHA256SUMS and the licence as a release, after the tests and a real run of each.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build, accept and publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: The tag is the crate's version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="tessel-host") | .version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, crate $version"; exit 1; }
+      - run: cargo test --locked --workspace
+      - name: User-mode emulator for aarch64
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: cargo run --locked -p tessel-host-xtask -- release --out dist
+      - run: cargo run --locked -p tessel-host-xtask -- accept --out dist --qemu /usr/bin/qemu-aarch64-static
+      - run: cp LICENSE dist/
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "tessel-host $GITHUB_REF_NAME" \
+            --notes "Static tessel-host for Linux x86_64 and aarch64 (musl), with manifest.json, SHA256SUMS and LICENSE. Built, tested and run (aarch64 emulated) by CI from $GITHUB_SHA."
