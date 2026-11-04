@@ -8,6 +8,7 @@ mod connection;
 mod dedup;
 pub mod file;
 mod frame;
+pub mod git;
 mod ids;
 pub mod pty;
 mod stream;
@@ -24,7 +25,8 @@ pub use frame::{
     wire_error, write_frame,
 };
 pub use ids::{
-    DedupKey, Digest, Epoch, FileVersion, LeaseKey, MAX_ID, RootId, StreamId, TerminalId, UploadId,
+    DedupKey, Digest, Epoch, FileVersion, LeaseKey, MAX_ID, RepoId, RootId, StreamId, TerminalId,
+    UploadId,
 };
 pub use stream::{Ack, AckError, Arrival, SendError, StreamPos, StreamReceiver, StreamSender};
 pub use wire::{

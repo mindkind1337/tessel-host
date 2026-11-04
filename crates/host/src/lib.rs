@@ -12,6 +12,8 @@ pub mod daemon;
 #[cfg(target_os = "linux")]
 pub mod files;
 #[cfg(target_os = "linux")]
+pub mod git;
+#[cfg(target_os = "linux")]
 mod log;
 #[cfg(target_os = "linux")]
 mod outbound;

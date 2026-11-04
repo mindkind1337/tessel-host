@@ -118,7 +118,7 @@ impl Client {
         };
         let hello = Hello {
             versions: vec![VERSION],
-            capabilities: vec!["pty".into(), "tree".into(), "editor".into()],
+            capabilities: vec!["pty".into(), "tree".into(), "editor".into(), "git".into()],
             budgets,
         };
         let ok = client.request("hello", &hello).expect("hello");

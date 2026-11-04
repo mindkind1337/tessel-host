@@ -43,12 +43,12 @@ impl Capability {
         }
     }
 
-    /// The negotiated capability that admits `kind`, or why none does. Roots serve both file
-    /// trees and the editor: `root.*` is admitted by either.
+    /// The negotiated capability that admits `kind`, or why none does. Roots serve file trees,
+    /// the editor and git: `root.*` is admitted by any of them.
     pub fn granted_for(kind: &str, negotiated: &[Capability]) -> Result<Capability, ErrorCode> {
         let wanted = Self::for_kind(kind).ok_or(ErrorCode::UnsupportedKind)?;
         let candidates: &[Capability] = if wanted == Self::Tree && kind.starts_with("root.") {
-            &[Self::Tree, Self::Editor]
+            &[Self::Tree, Self::Editor, Self::Git]
         } else {
             &[wanted]
         };

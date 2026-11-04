@@ -1,6 +1,6 @@
 # Native remote host plan
 
-Status: gates 1 to 5 implemented (below); gates 6 and 7 to come. Target: Linux
+Status: gates 1 to 6 implemented (below); gate 7 to come. Target: Linux
 x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
 No changes to the running Electron checkout. This is part of full Tessel parity,
 not a replacement for the remaining desktop work.
@@ -149,6 +149,45 @@ holder gets `terminal.lease_lost`; a stale `resume` attaches as a watcher;
 resizes are numbered events every attachment receives; the exit comes once,
 only as an event; snapshots include the main screen behind the alternate one,
 the kitty keyboard flags per screen, focus reporting and the cursor style.
+
+Gate 6 (git) is complete: `crates/host/src/git.rs` and the `git` messages of
+`PROTOCOL.md`. One worker thread runs git for the whole host, one command at a
+time (shared with `git.open` and `git.untracked`), each in its own process
+group at nice 10 and idle I/O class, with --no-optional-locks, a 2 s soft and
+5 s hard budget (process group killed), 8 MiB and 50,000 entries, keeping the
+last good status, marking it stale and backing off 1 s to 60 s. The cache is
+porcelain v2 with --untracked-files=normal, invalidated by inotify on worktree
+directories (watched before the read; ignored and untracked directories
+watched shallowly; new directories watched at once) and on the gitdir, common
+dir, refs and info, including linked worktrees. Edits become literal-pathspec
+statuses grouped for 300 ms (2 s max), mapped to the submodule or untracked
+directory around them so the answer matches a full status; index, HEAD, refs
+and ignore changes become full statuses (stale until done) and rebuild the
+watches. untrackedCache and fsmonitor are detected, used when configured, never
+enabled. Zero commands without a subscriber. Subscribers have their own queue
+drained by their window, and get the whole status again (reset) after falling
+behind.
+Evidence (Ubuntu 24.04 WSL, Rust 1.99.1, git 2.43.0), 6 reference tests over the
+real bridge, each step compared with a complete git status, three runs: edits
+(one git command per edit), staging, a staged rename, a deletion, ignored files
+and directories, untracked files and directories, an ignore rule change, a
+commit; a linked worktree (edits, a new file, a commit in the main worktree);
+a submodule changed and given a new file inside; an untracked directory listed
+on demand; nothing run without a subscriber; 50,100 untracked files marked
+truncated and never complete; a git killed at a 1 ms hard budget (test knob)
+retried at about 0, 1 and 3 s with the status stale.
+Benchmark (`tests/git_bench.rs`, release, ignored by default): 20,000 tracked
+files, 300,000 untracked files in 30 untracked directories plus 1,000 in tracked
+ones. First full status 108 ms over 3 commands and 54 kB (1,001 entries); edit
+to event p50 307 ms and p95 307 ms (the 300 ms grouping dominates), 40 commands
+and 5.2 kB for 40 edits; a full refresh 16 ms; a terminal's echo meanwhile p50
+0.40 ms, p95 0.48 ms, max 0.60 ms over 218 samples; 209 watches, coverage
+complete. For comparison, `git status --untracked-files=all` on the same
+repository printed 301,000 entries and 5.4 MB in 208 ms on this machine. Not
+measured: the production host (its disk and load made the old status take
+about 30 s there; never benchmarked there without a separate request), a
+repository whose untracked files sit individually in tracked directories beyond
+50,000 (it is reported truncated), network file systems.
 
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both

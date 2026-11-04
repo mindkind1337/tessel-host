@@ -3,7 +3,7 @@
 The wire contract between a Tessel client (the Rust desktop, later the Vue app) and
 `tessel-host` on a remote machine. `src/` implements it; `tests/fixtures/` holds one golden
 frame of each shape; `tests/wire.rs` checks the rules below and `tests/fuzz.rs` fuzzes them.
-Terminal, file tree and editor messages are below; git messages come with gate 6.
+Terminal, file tree, editor and git messages are below.
 
 ## Frames
 
@@ -224,7 +224,7 @@ Requests and their replies (`src/pty.rs` has every field):
 
 ## Editor (capability `editor`)
 
-Paths are below a root opened with `root.open` (admitted by either `tree` or `editor`).
+Paths are below a root opened with `root.open` (admitted by `tree`, `editor` or `git`).
 
 | request | reply | what it does |
 | --- | --- | --- |
@@ -259,6 +259,42 @@ Paths are below a root opened with `root.open` (admitted by either `tree` or `ed
   client resends its buffer after reconnecting. Temporary files of a daemon that died are
   removed by the next one, from a journal in its private runtime directory.
 - `compare` and a save's content check hash the file on the host, the same authority.
+
+## Git status (capability `git`)
+
+| request | reply | what it does |
+| --- | --- | --- |
+| `git.open` | `git.opened` | the repository holding a path below a root (a linked worktree is its own); what its own configuration already uses (`core.untrackedCache`, `core.fsmonitor`) and the git version |
+| `git.subscribe` | `git.subscribed` | starts this connection's stream of status changes |
+| `git.unsubscribe` | `done` | ends it |
+| `git.refresh` | `done` | reads the whole status again, soon |
+| `git.untracked` | `git.untracked_list` | the files inside an untracked directory shown as one entry |
+| `git.stats` | `git.stats_ok` | git commands run, their output bytes, the last full and partial durations, watches |
+
+- The status is git's own (`--porcelain=v2`, `--untracked-files=normal`): each entry carries its
+  porcelain record without the path (`record`), with `xy` and `sub` copied out, the path as raw
+  names, and for a rename the original path. A wholly untracked directory is one entry
+  (`untracked_dir`); its files come from `git.untracked` on demand. Ignored files are not shown.
+- The first event of a subscription carries the whole status (`reset: true`); then each
+  `git.changed` carries entries added or changed (`upsert`) and paths gone (`removed`), with the
+  state after it: the branch, and whether the status is `complete` (a full read finished within
+  its budgets, nothing cut, every directory watched) or `stale` (something to read again, or the
+  last read failed or was cut). A client that fell behind gets the whole status again (`reset`).
+- The cache is kept current from file system events: the worktree's directories (not inside
+  `.git`, ignored or untracked directories, which are watched for their own entries only) and
+  the git metadata (index, HEAD, refs, packed-refs, info). Changes are grouped for 300 ms (2 s at
+  most under continuous activity). A changed file costs one `git status` limited to the paths
+  that changed, as literal pathspecs (a path inside a submodule asks about the submodule, a path
+  inside an untracked directory about that directory). An index, HEAD, refs or ignore change
+  costs one full status; the status is marked stale until it is done.
+- One git command at a time on the whole host, in its own process group, at nice 10 and idle I/O
+  priority, never taking git's optional locks (it never writes the index). Budgets: 2 s soft
+  (reported as `slow`), 5 s hard (the process group is killed), 8 MiB of output, 50,000 entries
+  (beyond: `truncated`, never `complete`). A failed, killed or cut read keeps the last good status,
+  marks it stale and is retried after 1 s, 2 s, 4 s… up to a minute.
+- Nothing runs for a repository nobody subscribed to: no watch, no git command.
+- The host never changes the repository's configuration: it uses `core.untrackedCache` and
+  `core.fsmonitor` when the repository has them, and turns neither on.
 
 ## Errors
 
@@ -313,6 +349,8 @@ A client reads a code it does not know as `unknown`.
 | `tree.expand` of an unreadable directory | after hello | reply `permission_denied` |
 | `tree.expand` of an excluded directory, or beyond the watch limit | after hello | listing with `watched: false` |
 | `tree.subscribe` or `expand` under a 16 KiB frame budget | after hello | reply `bad_request` |
-| `root.open` with only `editor` granted | after hello | `root.opened` |
+| `root.open` with only `editor` or `git` granted | after hello | `root.opened` |
+| a file edited in a subscribed repository | after hello | one partial `git status`, then `git.changed` |
+| more than 50,000 status entries | after hello | `git.changed` with `truncated: true`, never `complete` |
 | `file.write_commit` after the file changed on disk | after hello | reply `conflict`; the file is the other writer's |
 | `file.write_begin` or `chunk` on a full disk | after hello | reply `no_space`; no temporary file, the file intact |

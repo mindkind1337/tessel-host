@@ -70,7 +70,7 @@ fn from_errno(error: &io::Error) -> WireError {
 
 /// Watches this daemon may hold: its own cap, a quarter of the user's inotify budget (other
 /// programs watch too), and the descriptors it may open. TESSEL_HOST_MAX_WATCHES lowers it.
-fn max_watches() -> usize {
+pub(crate) fn max_watches() -> usize {
     let kernel = std::fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())

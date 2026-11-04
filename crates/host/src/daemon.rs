@@ -1,6 +1,7 @@
 //! `tessel-host serve`: accepts this user's connections on the private socket and answers them
 //! with the protocol. Threads, not an async runtime: a few clients, each with its own reader.
 use crate::files::Files;
+use crate::git::Git;
 use crate::log::Log;
 use crate::outbound::Outbound;
 use crate::pty::{Peer, Terminals};
@@ -17,7 +18,7 @@ use tessel_host_protocol::{
     HostLimits, MAX_FRAME_BYTES, PersistenceMethod, RawMessage, ReplyMessage, Step, StreamId,
     WireError, encode_frame, read_frame, wire_error,
 };
-use tessel_host_protocol::{file, pty, tree};
+use tessel_host_protocol::{file, git, pty, tree};
 
 const MAX_CLIENTS: usize = 16;
 /// A connection that has not said hello by then is closed; after hello there is no limit.
@@ -153,7 +154,12 @@ fn run(
     let trees = Trees::new()?;
     let shared = Arc::new(Shared {
         limits: HostLimits {
-            capabilities: vec![Capability::Pty, Capability::Tree, Capability::Editor],
+            capabilities: vec![
+                Capability::Pty,
+                Capability::Tree,
+                Capability::Editor,
+                Capability::Git,
+            ],
             budgets,
             epoch: epoch.clone(),
             info: HostInfo {
@@ -165,6 +171,7 @@ fn run(
         },
         terminals: Terminals::new(epoch, budgets.total_ring_bytes as usize),
         files: Files::new(trees.clone(), runtime.dir.join("uploads")),
+        git: Git::new(trees.clone())?,
         trees,
         next_peer: AtomicU64::new(1),
     });
@@ -213,6 +220,7 @@ struct Shared {
     terminals: Arc<Terminals>,
     trees: Arc<Trees>,
     files: Arc<Files>,
+    git: Arc<Git>,
     next_peer: AtomicU64,
 }
 
@@ -381,6 +389,30 @@ fn handle(
             .body_as::<file::Mkdir>()
             .and_then(|r| shared.files.mkdir(r))
             .map(|()| done()),
+        git::kind::OPEN => message
+            .body_as::<git::Open>()
+            .and_then(|r| shared.git.open(r))
+            .map(|opened| RawMessage::of(git::kind::OPENED, &opened)),
+        git::kind::SUBSCRIBE => tree_frame(peer)
+            .and_then(|()| message.body_as::<git::Subscribe>())
+            .and_then(|r| shared.git.subscribe(r, peer))
+            .map(|subscribed| RawMessage::of(git::kind::SUBSCRIBED, &subscribed)),
+        git::kind::UNSUBSCRIBE => message
+            .body_as::<git::Unsubscribe>()
+            .and_then(|r| shared.git.unsubscribe(peer.id, &r))
+            .map(|()| done()),
+        git::kind::REFRESH => message
+            .body_as::<git::Refresh>()
+            .and_then(|r| shared.git.refresh(r))
+            .map(|()| done()),
+        git::kind::UNTRACKED => message
+            .body_as::<git::Untracked>()
+            .and_then(|r| shared.git.untracked(r))
+            .map(|list| RawMessage::of(git::kind::UNTRACKED_LIST, &list)),
+        git::kind::STATS => message
+            .body_as::<git::Stats>()
+            .and_then(|r| shared.git.stats(r))
+            .map(|stats| RawMessage::of(git::kind::STATS_OK, &stats)),
         _ => Err(WireError::new(ErrorCode::UnsupportedKind)),
     };
     (reply, None)
@@ -436,7 +468,10 @@ fn client(stream: UnixStream, shared: &Shared) {
             Ok(Step::Ack(ack)) => {
                 let routed = match shared.terminals.ack(id, &ack) {
                     Ok(true) => Ok(true),
-                    Ok(false) => shared.trees.ack(id, &ack),
+                    Ok(false) => match shared.trees.ack(id, &ack) {
+                        Ok(false) => shared.git.ack(id, &ack),
+                        other => other,
+                    },
                     Err(refusal) => Err(refusal),
                 };
                 if let Err(refusal) = routed {
@@ -473,6 +508,7 @@ fn client(stream: UnixStream, shared: &Shared) {
     shared.terminals.disconnect(id);
     shared.trees.disconnect(id);
     shared.files.disconnect(id);
+    shared.git.disconnect(id);
     out.end();
     let _ = writer.join();
     let _ = reader.shutdown(Shutdown::Both);

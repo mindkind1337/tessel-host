@@ -82,6 +82,11 @@ token!(
     "root id"
 );
 token!(
+    /// A repository opened for its git status, valid within the epoch.
+    RepoId,
+    "repository id"
+);
+token!(
     /// One version of a file: changes whenever the file does.
     FileVersion,
     "file version"
