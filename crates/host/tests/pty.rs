@@ -424,7 +424,10 @@ fn a_busy_input_retried_after_a_later_one_is_typed_is_never_taken_for_a_duplicat
     let mut home = Home::new("busyretry");
     let mut client = home.client(Budgets::SLOW_HOST);
     // A program that never reads: input piles up until it is refused as busy.
-    let created = create(&mut client, 20, sh("sleep 60"), SIZE);
+    // Raw mode: a full input queue holds the writer back instead of dropping characters (in
+    // canonical mode some kernels drop them, and input then never piles up).
+    let created = create(&mut client, 20, sh("stty raw -echo; sleep 60"), SIZE);
+    std::thread::sleep(Duration::from_millis(300));
     let big = "x".repeat(60_000);
     let mut id = 0;
     let busy_id = loop {
