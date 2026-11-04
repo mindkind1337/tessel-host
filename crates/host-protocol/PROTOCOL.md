@@ -145,7 +145,10 @@ Requests and their replies (`src/pty.rs` has every field):
   attachment names the last `seq` the client applied (`after`). If what follows is still kept,
   the reply says `replay` and those events follow; otherwise it says `snapshot`:
   `terminal.snapshot` events at the barrier `seq` come first, then what follows it. Either way no
-  event arrives twice and none is skipped silently.
+  event arrives twice and none is skipped silently. Without `after` (since 0.1.1: a client that
+  shows nothing of the terminal yet, such as a desktop that just started), the reply always says
+  `snapshot`: the current screen first, then live events. An older daemon refuses that request
+  (`bad_request`); it never reads a missing `after` as 0.
 - `terminal.exit` comes once per attachment, after every event up to its `seq`: show the end
   when it arrives (the attach reply does not carry it).
 - A snapshot redraws the screen without replaying what produced it, so no clipboard write, bell
@@ -174,7 +177,10 @@ Requests and their replies (`src/pty.rs` has every field):
   reply) is answered `duplicate: true` and not typed again; one refused as `busy` (input waiting
   for the program is limited to 1 MiB) is not remembered and can be retried, even after later
   ones went through. The last 1024 applied identifiers are remembered; an older one is refused
-  (`bad_request`) rather than guessed.
+  (`bad_request`) rather than guessed. An attachment that holds the lease says how far its
+  inputs went (`last_input`, the highest identifier used, 0 for a new lease; since 0.1.1): a
+  client that kept the lease across its own restart numbers its inputs above it, and must not
+  type with a lease whose `last_input` it was not given.
 - `close` hangs up the process group, kills it 3 seconds later if needed, and forgets the
   terminal once every attachment received its last events and its exit (at most 60 seconds after
   the exit, so a stalled watcher cannot keep it). Its history then stops counting against the
@@ -344,6 +350,8 @@ A client reads a code it does not know as `unknown`.
 | `terminal.input` with an `input_id` already applied | after hello | `duplicate: true`, not typed |
 | `terminal.input` retrying one refused as `busy` | after hello | typed (or `busy` again), never `duplicate` |
 | `terminal.attach` resuming a lease taken meanwhile | after hello | attached, watching, no lease in the reply |
+| `terminal.attach` without `after` | after hello | `snapshot` first, then live (0.1.1; older: `bad_request`) |
+| `terminal.attach` holding the lease | after hello | `last_input` in the reply (0.1.1) |
 | `terminal.create` or `attach` under a 96 KiB frame budget | after hello | reply `bad_request` |
 | `tree.expand` through a symbolic link | after hello | reply `bad_request` |
 | `tree.expand` of an unreadable directory | after hello | reply `permission_denied` |

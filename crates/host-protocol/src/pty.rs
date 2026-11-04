@@ -136,14 +136,19 @@ pub enum Writer {
 }
 
 /// Start receiving a terminal's output. `after`: the last sequence number the client applied
-/// (0: none). `epoch`: the host epoch the client knew the terminal from; another one is refused
-/// with `epoch_mismatch` (the daemon restarted, its terminals are gone).
+/// (0: none of its events, so everything still kept is replayed). Absent: the client shows
+/// nothing of this terminal (a desktop that just started), so the attachment always starts with
+/// a snapshot of the current screen, then live events; a daemon from before 0.1.1 refuses that
+/// request (`bad_request`, a missing field) rather than reading it as 0. `epoch`: the host epoch
+/// the client knew the terminal from; another one is refused with `epoch_mismatch` (the daemon
+/// restarted, its terminals are gone).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attach {
     pub terminal: TerminalId,
     pub epoch: Epoch,
-    pub after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
     pub writer: Writer,
 }
 
@@ -170,6 +175,13 @@ pub struct Attached {
     /// watches (and says so), it is not refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseKey>,
+    /// With a lease: the highest input identifier this lease already used (0 for a new lease),
+    /// so a client that kept the lease across its own restart numbers its inputs above it
+    /// instead of reusing identifiers the daemon would take for repeats. Always present with a
+    /// lease from 0.1.1 on; a client must not type with a lease whose numbering it does not
+    /// know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input: Option<u64>,
 }
 
 /// Bytes to type. Each `input_id` is typed at most once per lease: a retry of one already

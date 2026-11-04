@@ -246,6 +246,65 @@ fn taking_the_lease_back_and_forth_keeps_each_side_in_order() {
     b.close();
 }
 
+/// The desktop quits and starts again with the terminal's id, epoch and lease (kept encrypted
+/// by the desktop): it attaches fresh, gets the current screen first, and its inputs are typed,
+/// numbered above the ones the lease used before, not taken for repeats.
+#[test]
+fn a_restarted_desktop_gets_the_screen_and_types_with_its_kept_lease() {
+    let mut home = Home::new("clientrestart");
+    let (first, _connector_first) = connect(&mut home);
+    let (terminal, events) = Terminal::create(
+        &first,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let (id, epoch, lease) = (
+        terminal.id().clone(),
+        first.epoch().unwrap(),
+        terminal.lease().unwrap(),
+    );
+    let (mut text, mut seen) = (Vec::new(), Vec::new());
+    terminal.input(b"before restart\n").unwrap();
+    text_until(&events, &mut text, &mut seen, |t, _| {
+        count(t, "before restart") >= 2
+    });
+    drop(terminal);
+    drop(events);
+    first.close();
+
+    let (second, _connector_second) = connect(&mut home);
+    assert_eq!(second.epoch(), Some(epoch.clone()), "the same daemon");
+    let (terminal, events) = Terminal::attach_fresh(&second, id, epoch, Some(lease)).unwrap();
+    assert!(terminal.lease().is_some(), "the kept lease still types");
+    match events.recv_timeout(WAIT).unwrap() {
+        TerminalEvent::Snapshot { size, data, .. } => {
+            let mut screen = vt100::Parser::new(size.rows, size.cols, 0);
+            screen.process(&data);
+            assert!(
+                screen.screen().contents().contains("before restart"),
+                "{}",
+                screen.screen().contents()
+            );
+        }
+        other => panic!("the screen first, got {other:?}"),
+    }
+    let (mut text, mut seen) = (Vec::new(), Vec::new());
+    terminal.input(b"after restart\n").unwrap();
+    text_until(&events, &mut text, &mut seen, |t, _| {
+        count(t, "after restart") >= 2
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    while let Ok(TerminalEvent::Output { data, .. }) = events.try_recv() {
+        text.extend_from_slice(&data);
+    }
+    assert_eq!(count(&text, "after restart"), 2, "the echo and cat's copy");
+    assert_eq!(count(&text, "before restart"), 0, "nothing replayed");
+    second.close();
+}
+
 #[test]
 fn a_cut_link_reconnects_and_the_terminal_continues_exactly() {
     let mut home = Home::new("clientcut");

@@ -21,7 +21,8 @@ use tessel_host_protocol::pty::{
     LeaseLost, Output, Resize, Resized, Signal, SignalRequest, Size, Snapshot, Writer,
 };
 use tessel_host_protocol::{
-    Chunk, DedupKey, Epoch, ErrorCode, LeaseKey, MAX_CHUNK_BYTES, RawMessage, StreamId, TerminalId,
+    Chunk, DedupKey, Epoch, ErrorCode, LeaseKey, MAX_CHUNK_BYTES, MAX_ID, RawMessage, StreamId,
+    TerminalId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,13 +141,36 @@ impl Terminal {
         Self::attach(client, created.terminal, epoch, 0, Some(created.lease))
     }
 
-    /// Attaches to a terminal known from before (after `after`, its last applied event), as
-    /// the lease holder when `lease` is given and still valid, else as a watcher.
+    /// Attaches to a terminal this pane still shows (after `after`, the last event it applied),
+    /// as the lease holder when `lease` is given and still valid, else as a watcher.
     pub fn attach(
         client: &Client,
         terminal: TerminalId,
         epoch: Epoch,
         after: u64,
+        lease: Option<LeaseKey>,
+    ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
+        Self::attach_from(client, terminal, epoch, Some(after), lease)
+    }
+
+    /// Attaches to a terminal this pane shows nothing of (the desktop just started): the
+    /// events start with a snapshot of the current screen, then go on live. With a lease kept
+    /// from before, inputs are numbered above the ones it already used. Needs tessel-host 0.1.1
+    /// or later; an older daemon refuses it.
+    pub fn attach_fresh(
+        client: &Client,
+        terminal: TerminalId,
+        epoch: Epoch,
+        lease: Option<LeaseKey>,
+    ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
+        Self::attach_from(client, terminal, epoch, None, lease)
+    }
+
+    fn attach_from(
+        client: &Client,
+        terminal: TerminalId,
+        epoch: Epoch,
+        after: Option<u64>,
         lease: Option<LeaseKey>,
     ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
         let (events, receiver) = sync_channel(crate::link::STREAM_BUFFER);
@@ -157,7 +181,7 @@ impl Terminal {
             lease: Mutex::new(lease),
             delivery: Mutex::new(Delivery {
                 generation: 0,
-                last: after,
+                last: after.unwrap_or(0),
                 disconnected: false,
                 exited: false,
                 stream: None,
@@ -168,7 +192,7 @@ impl Terminal {
         });
         let link = client.link()?;
         let had_lease = shared.lease.lock().unwrap().is_some();
-        let attached = shared.request_attach(&link, shared.writer())?;
+        let attached = shared.request_attach(&link, shared.writer(), after)?;
         shared.start(&link, &attached, 0, had_lease, false);
         client.register(Arc::downgrade(&shared) as std::sync::Weak<dyn Resume>);
         Ok((
@@ -203,10 +227,18 @@ impl Terminal {
             )))
     }
 
-    /// Types `bytes` (split in 64 KiB inputs), each exactly once.
+    /// Types `bytes` (split in 64 KiB inputs). Each input is typed at most once: it is retried
+    /// with the same number through busy answers and reconnections until `request_timeout`;
+    /// `Ok` means it was typed, an error after a reconnection that outlasted the timeout means
+    /// it may or may not have been.
     pub fn input(&self, bytes: &[u8]) -> Result<(), ClientError> {
         for piece in bytes.chunks(MAX_CHUNK_BYTES) {
             let id = self.shared.next_input.fetch_add(1, Ordering::SeqCst);
+            if id > MAX_ID {
+                return Err(ClientError::Protocol(
+                    "this lease has used every input number".into(),
+                ));
+            }
             let mut pause = Duration::from_millis(20);
             let deadline = Instant::now() + self.shared.client.options().request_timeout;
             loop {
@@ -293,7 +325,7 @@ impl Terminal {
         // new attachment replays everything after the last event handed over.
         let generation = shared.next_generation();
         let replaced = shared.delivery.lock().unwrap().stream.clone();
-        let result = shared.request_attach(&link, Writer::Take);
+        let result = shared.request_attach(&link, Writer::Take, shared.after());
         let attached = match result {
             Ok(attached) => {
                 *shared.lease.lock().unwrap() = attached.lease.clone();
@@ -304,7 +336,8 @@ impl Terminal {
                 // Back to following as before, on a new attachment of its own.
                 let generation = shared.next_generation();
                 let had_lease = shared.lease.lock().unwrap().is_some();
-                if let Ok(attached) = shared.request_attach(&link, shared.writer()) {
+                if let Ok(attached) = shared.request_attach(&link, shared.writer(), shared.after())
+                {
                     shared.start(&link, &attached, generation, had_lease, false);
                 }
                 Err(error)
@@ -384,20 +417,51 @@ impl Shared {
         self.delivery.lock().unwrap().generation == generation
     }
 
-    /// Attaches after the last event handed over.
-    fn request_attach(&self, link: &Arc<Link>, writer: Writer) -> Result<Attached, ClientError> {
+    /// Attaches after the last event handed over, or with a snapshot first when this client
+    /// shows nothing yet (`after: None`, the first attachment of `attach_fresh` only).
+    ///
+    /// With a lease, the daemon says how far its inputs went (`last_input`) and the next input
+    /// is numbered above: a lease kept across a restart of the desktop must never reuse an
+    /// identifier the daemon would take for a repeat (and silently not type). A lease whose
+    /// numbering is not given, or exhausted, is refused here rather than guessed.
+    fn request_attach(
+        &self,
+        link: &Arc<Link>,
+        writer: Writer,
+        after: Option<u64>,
+    ) -> Result<Attached, ClientError> {
         let request = Attach {
             terminal: self.terminal.clone(),
             epoch: self.epoch.lock().unwrap().clone(),
-            after: self.delivery.lock().unwrap().last,
+            after,
             writer,
         };
-        link.request(
-            RawMessage::of(pty::kind::ATTACH, &request),
-            self.client.options().request_timeout,
-        )?
-        .body_as()
-        .map_err(ClientError::Refused)
+        let attached: Attached = link
+            .request(
+                RawMessage::of(pty::kind::ATTACH, &request),
+                self.client.options().request_timeout,
+            )?
+            .body_as()
+            .map_err(ClientError::Refused)?;
+        if attached.lease.is_some() {
+            match attached.last_input.filter(|used| *used < MAX_ID) {
+                Some(used) => {
+                    self.next_input.fetch_max(used + 1, Ordering::SeqCst);
+                }
+                None => {
+                    self.detach(link, attached.stream.clone());
+                    return Err(ClientError::Protocol(
+                        "the host did not say how far this lease's inputs went".into(),
+                    ));
+                }
+            }
+        }
+        Ok(attached)
+    }
+
+    /// After the last event handed over (a reattachment or a takeover).
+    fn after(&self) -> Option<u64> {
+        Some(self.delivery.lock().unwrap().last)
     }
 
     /// Stops an attachment nobody follows any more (best effort: the link may be gone).
@@ -567,7 +631,7 @@ impl Shared {
         }
         let Some(link) = link else { return };
         let had_lease = self.lease.lock().unwrap().is_some();
-        match self.request_attach(&link, self.writer()) {
+        match self.request_attach(&link, self.writer(), self.after()) {
             Ok(attached) => {
                 if self.current(generation) {
                     self.start(&link, &attached, generation, had_lease, true);

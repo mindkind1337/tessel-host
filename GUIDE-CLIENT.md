@@ -87,11 +87,15 @@ retry by themselves where that is safe, and say so otherwise.
 let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
 ```
 
-- Keep `terminal.id()`, `client.epoch()` and the number of the last event the pane actually
-  applied (an `Output`'s or `Resized`'s `seq`, a `Snapshot`'s `at`) with the pane: after a
-  restart of the desktop, `Terminal::attach(&client, id, epoch, applied, lease)` continues where
-  it was (or says `Lost`). `terminal.last_seq()` is the last event handed to your receiver, not
-  necessarily applied yet: do not persist it as the pane's position. The lease is a capability (whoever has it types into the terminal): keep it
+- Keep `terminal.id()` and `client.epoch()` with the pane. After a restart of the desktop the
+  pane shows nothing, so attach with `Terminal::attach_fresh(&client, id, epoch, lease)`: the
+  events start with a snapshot of the current screen, then go on live (or the attach says the
+  terminal is gone). Its inputs are numbered above the ones the lease already used (the daemon
+  says how far they went); a lease whose numbering the daemon does not give is refused, never
+  restarted from 1. Needs tessel-host 0.1.1 or later. `Terminal::attach(.., after, ..)` is for a
+  pane that still shows the terminal (after the last event it applied: an `Output`'s or
+  `Resized`'s `seq`, a `Snapshot`'s `at`). `terminal.last_seq()` is the last event handed to your
+  receiver, not necessarily applied yet. The lease is a capability (whoever has it types into the terminal): keep it
   in memory, or encrypted with the desktop's secrets if it must outlive a restart; never in the
   workspace file, a backup or a log (`LeaseKey`'s `Debug` hides it). Without it, attach as a
   watcher and take the lease (`take_lease`).

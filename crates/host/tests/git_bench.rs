@@ -60,7 +60,7 @@ fn echo_probe(mut client: Client, stop: Arc<AtomicBool>) -> Vec<f64> {
         &Attach {
             terminal: created.terminal.clone(),
             epoch: client.epoch.clone(),
-            after: 0,
+            after: Some(0),
             writer: Writer::Resume(created.lease.clone()),
         },
     );

@@ -36,6 +36,16 @@ fn attach(
     after: u64,
     writer: Writer,
 ) -> Attached {
+    attach_from(client, viewer, terminal, Some(after), writer)
+}
+
+fn attach_from(
+    client: &mut Client,
+    viewer: &mut Viewer,
+    terminal: &TerminalId,
+    after: Option<u64>,
+    writer: Writer,
+) -> Attached {
     let attached: Attached = client.ask(
         kind::ATTACH,
         &Attach {
@@ -149,12 +159,17 @@ fn a_lost_reply_never_types_twice_and_leases_decide_who_types() {
 
     let mut client = home.client(Budgets::SLOW_HOST);
     let after = viewer.last;
-    attach(
+    let resumed = attach(
         &mut client,
         &mut viewer,
         &created.terminal,
         after,
         Writer::Resume(created.lease.clone()),
+    );
+    assert_eq!(
+        resumed.last_input,
+        Some(1),
+        "where this lease's inputs went"
     );
     assert!(
         input(&mut client, &created.terminal, &created.lease, 1, "hello\n")
@@ -178,7 +193,9 @@ fn a_lost_reply_never_types_twice_and_leases_decide_who_types() {
     let mut other = home.client(Budgets::SLOW_HOST);
     let watching = attach(&mut other, &mut watcher, &created.terminal, 0, Writer::None);
     assert!(watching.lease.is_none());
+    assert_eq!(watching.last_input, None, "no lease, no numbering");
     let taken = attach(&mut other, &mut watcher, &created.terminal, 0, Writer::Take);
+    assert_eq!(taken.last_input, Some(0), "a new lease starts from nothing");
     let new_lease = taken.lease.unwrap();
     let refused = input(&mut client, &created.terminal, &created.lease, 3, "x\n").unwrap_err();
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
@@ -378,7 +395,7 @@ fn after_a_daemon_restart_its_terminals_are_reported_gone() {
                 &Attach {
                     terminal: created.terminal.clone(),
                     epoch,
-                    after: 0,
+                    after: Some(0),
                     writer: Writer::None,
                 },
             )
@@ -496,6 +513,56 @@ fn an_input_identifier_older_than_the_window_is_refused_not_guessed() {
             .code,
         ErrorCode::BadRequest
     );
+    // Beyond the window too, a resumed lease continues from the highest number it used.
+    let mut viewer = Viewer::new();
+    let resumed = attach(
+        &mut client,
+        &mut viewer,
+        &created.terminal,
+        0,
+        Writer::Resume(created.lease.clone()),
+    );
+    assert_eq!(resumed.last_input, Some(1100));
+}
+
+#[test]
+fn an_attachment_without_after_starts_with_the_current_screen() {
+    let mut home = Home::new("fresh");
+    let mut client = home.client(Budgets::SLOW_HOST);
+    let created = create(&mut client, 31, sh("echo first screen; cat"), SIZE);
+    let mut viewer = Viewer::new();
+    attach(&mut client, &mut viewer, &created.terminal, 0, Writer::None);
+    viewer.until(&mut client, |v| v.text().contains("first screen"));
+
+    // A desktop that just started shows nothing: even with the whole history kept, it gets
+    // the screen first, not a replay from the start.
+    let mut other = home.client(Budgets::SLOW_HOST);
+    let mut fresh = Viewer::new();
+    let attached = attach_from(
+        &mut other,
+        &mut fresh,
+        &created.terminal,
+        None,
+        Writer::None,
+    );
+    assert_eq!(attached.mode, AttachMode::Snapshot);
+    fresh.until(&mut other, |v| !v.snapshots.is_empty());
+    assert_eq!(
+        (fresh.snapshots[0].at, fresh.snapshots[0].resync),
+        (attached.seq, false)
+    );
+    assert!(
+        fresh.text.is_empty(),
+        "no output replayed before the snapshot"
+    );
+    assert!(
+        fresh.screen.screen().contents().contains("first screen"),
+        "{}",
+        fresh.screen.screen().contents()
+    );
+    // Then live: what comes next arrives as output after the snapshot.
+    input(&mut client, &created.terminal, &created.lease, 1, "next\n").unwrap();
+    fresh.until(&mut other, |v| count(&v.text(), "next") >= 2);
 }
 
 #[test]

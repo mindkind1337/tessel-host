@@ -100,6 +100,17 @@ impl Lease {
         }
     }
 
+    /// The highest input identifier this lease used: a client numbering above it never reuses
+    /// one (a remembered one would be taken for a repeat, a forgotten one refused).
+    fn highest(&self) -> u64 {
+        self.seen
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(self.forgotten)
+    }
+
     fn remember(&mut self, id: u64) {
         self.applied.push_back(id);
         self.seen.insert(id);
@@ -565,7 +576,7 @@ impl Terminals {
             .terms
             .get_mut(&request.terminal)
             .ok_or_else(|| refuse(ErrorCode::NotFound))?;
-        if request.after > term.seq {
+        if request.after.is_some_and(|after| after > term.seq) {
             return Err(refuse_with(
                 ErrorCode::BadRequest,
                 "after is beyond this terminal's events",
@@ -598,9 +609,18 @@ impl Terminals {
             // Taken by someone else meanwhile: attached all the same, watching only.
             Writer::Resume(key) => term.check_lease(&key).ok().map(|()| key),
         };
-        let replay = request.after + 1 >= term.first;
-        let (mode, snapshot, next) = if replay {
-            (AttachMode::Replay, VecDeque::new(), request.after + 1)
+        let last_input = term
+            .lease
+            .as_ref()
+            .filter(|_| lease.is_some())
+            .map(Lease::highest);
+        // Without `after` the client shows nothing yet: always the current screen first.
+        let replay_from = request
+            .after
+            .filter(|after| after + 1 >= term.first)
+            .map(|after| after + 1);
+        let (mode, snapshot, next) = if let Some(next) = replay_from {
+            (AttachMode::Replay, VecDeque::new(), next)
         } else {
             (AttachMode::Snapshot, term.snapshot(false), term.seq + 1)
         };
@@ -622,6 +642,7 @@ impl Terminals {
             mode,
             seq: term.seq,
             lease,
+            last_input,
         })
     }
 
