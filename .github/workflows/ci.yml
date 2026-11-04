@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  languages:
+    name: No JavaScript
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse .js, .cjs and .mjs files (TypeScript only, see CONTRIBUTING.md)
+        run: |
+          found=$(git ls-files | grep -E '\.(js|cjs|mjs)$' | grep -Ev '(^|/)node_modules/' || true)
+          if [ -n "$found" ]; then
+            echo "JavaScript files are not allowed here; write TypeScript (.ts or .mts):"
+            echo "$found"
+            exit 1
+          fi
+
+  test:
+    name: Format, Clippy, tests, fuzzing
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - name: Longer protocol fuzzing (release)
+        run: TESSEL_FUZZ_ITERATIONS=200000 cargo test --locked --release -p tessel-host-protocol --test fuzz
+
+  release:
+    name: Static musl programs (x86_64, aarch64)
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: User-mode emulator for aarch64
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Build, check the ELF files, write manifest.json and SHA256SUMS
+        run: cargo run --locked -p tessel-host-xtask -- release --out dist
+      - name: Run each program for real (aarch64 emulated)
+        run: cargo run --locked -p tessel-host-xtask -- accept --out dist --qemu /usr/bin/qemu-aarch64-static
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tessel-host-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

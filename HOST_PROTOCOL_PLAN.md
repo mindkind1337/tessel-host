@@ -1,13 +1,13 @@
 # Native remote host plan
 
-Status: design for review, not an implemented feature. Target: Linux x86_64 and
-aarch64 musl executables in `~/.tessel-server`, installed without root. No changes
-to the running Electron checkout. This is part of full Tessel parity, not a
-replacement for the remaining desktop work.
+Status: gates 1 and 2 implemented (below); gates 3 to 7 to come. Target: Linux
+x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
+No changes to the running Electron checkout. This is part of full Tessel parity,
+not a replacement for the remaining desktop work.
 
 Review: Darwin approved gates 1–3 on 2026-11-03 with the amendments below.
-The protocol foundation now lives in `crates/host-protocol`; daemon, PTY,
-installation and desktop transport integration are not implemented yet.
+The protocol lives in `crates/host-protocol`, the daemon in `crates/host`; PTY,
+tree, editor, git and desktop transport integration are not implemented yet.
 
 Ownership handoff: Halley takes gates 1–7; Hopper returns to desktop UI parity.
 
@@ -61,14 +61,13 @@ host.info, killed bridge, same epoch. x86_64 is 803,624 bytes (static-pie),
 aarch64 710,432 bytes (static). Not verified: survival of a real SSH logout,
 a real host other than this WSL, aarch64 on real hardware, builds being
 reproducible, and Windows compilation of the host crates.
-`cargo test --locked -j 2 -p tessel-host-protocol` runs only this lightweight crate.
-Workspace default-members remains the desktop; existing desktop commands retain
-their scope. The lockfile adds only the local crate, no dependency upgrades.
-
-Local Linux validation uses isolated CARGO_HOME/RUSTUP_HOME below
-`~/.local/share/tessel-host-validation/` and a separate target directory there.
-No shell profile or global PATH was changed. musl and arm64 build/runtime
-acceptance remain outstanding; Windows+WSL tests do not prove those targets.
+Repository: since gate 2 this work lives in its own repository, `tessel-host`
+(moved from tessel-rust with its history), because the Rust and Vue versions both
+consume it and it has its own releases and CI. tessel-rust depends on a pinned
+commit of `tessel-host-protocol`. Its CI runs format, strict Clippy, the tests,
+200,000 fuzzing iterations, both release builds and their acceptance, and keeps
+`manifest.json`, `SHA256SUMS` and the programs as an artifact. Everything that is
+not Rust is TypeScript (see CONTRIBUTING.md); CI refuses JavaScript files.
 
 ## Evidence and scope
 
