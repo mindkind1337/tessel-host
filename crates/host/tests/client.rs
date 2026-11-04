@@ -255,7 +255,7 @@ fn taking_the_lease_back_and_forth_keeps_each_side_in_order() {
 /// numbered above the ones the lease used before, not taken for repeats.
 #[test]
 fn a_restarted_desktop_gets_the_screen_and_types_with_its_kept_lease() {
-    let mut home = Home::new("clientrestart");
+    let mut home = Home::new("clientdesktop");
     let (first, _connector_first) = connect(&mut home);
     let (terminal, events) = Terminal::create(
         &first,

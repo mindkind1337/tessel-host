@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 use tessel_host_protocol::pty::{self, Exit, Output, Resized, Snapshot};
@@ -22,9 +23,16 @@ pub struct Home {
     pub wrap: Option<Vec<String>>,
 }
 
+/// Homes made by this test process: every one gets its own directory, even under one name.
+static HOMES: AtomicUsize = AtomicUsize::new(0);
+
 impl Home {
     pub fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("tessel-pty-{name}-{}", std::process::id()));
+        // Tests of one binary run in one process, in parallel: the process id alone would give
+        // two homes of the same name one directory (and one daemon), each wiping the other's.
+        let n = HOMES.fetch_add(1, Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("tessel-pty-{name}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();

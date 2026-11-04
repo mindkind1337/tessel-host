@@ -39,6 +39,18 @@ Client (`tessel-host-client`), no daemon change:
   this. Nothing changes on the wire. Hiding a value from `Debug` does not wipe it from
   memory: keep such values encrypted at rest.
 
+Repository:
+
+- `fixtures/install/plan.json`: the install plan's eight commands for x86_64 and aarch64
+  (version 0.1.1, a fixed nonce), byte for byte, checked against `install::plan` by a test, so
+  another client's port of the install can be compared exactly.
+- `cargo run -p tessel-host --example remote_trial`: an acceptance run on a real Linux host
+  through the local SSH client (install without root with its digest checked on the host,
+  terminal with a link cut and a fresh snapshot, watched directory, editor saves, git), timing
+  each step and removing what it made. Host and user are arguments; Linux only.
+- Tests: two tests of one process no longer share a home directory when they use the same
+  name. They did, and wiped each other's daemon and repository now and then (a flaky CI run).
+
 ## 0.1.1
 
 Daemon and protocol:
