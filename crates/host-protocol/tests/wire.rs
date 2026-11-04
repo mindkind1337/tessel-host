@@ -692,6 +692,45 @@ fn roots_are_admitted_by_the_tree_or_the_editor_capability() {
 }
 
 #[test]
+fn a_deduplication_key_never_shows_in_debug_output() {
+    use tessel_host_protocol::pty::{Create, Size};
+    let key = DedupKey::from_bytes([0xcd; 16]);
+    let create = Create {
+        dedup: key.clone(),
+        argv: vec!["sh".into()],
+        cwd: None,
+        env: Default::default(),
+        size: Size { rows: 24, cols: 80 },
+    };
+    let shown = format!(
+        "{key:?} {:?} {create:?} {:?}",
+        Some(key.clone()),
+        RawMessage::of("terminal.create", &create)
+    );
+    assert!(!shown.contains("cdcd"), "{shown}");
+    assert_eq!(format!("{key:?}"), "DedupKey(<hidden>)");
+    let input = RawMessage::of(
+        "terminal.input",
+        &tessel_host_protocol::pty::Input {
+            terminal: TerminalId::from_bytes([1; 16]),
+            lease: LeaseKey::from_bytes([0xef; 16]),
+            input_id: 1,
+            data: Chunk::new(b"typed secret".to_vec()).unwrap(),
+        },
+    );
+    let shown = format!("{input:?}");
+    assert!(
+        !shown.contains("efef") && !shown.contains("dHlwZWQ") && shown.contains("terminal.input"),
+        "a message body never shows: {shown}"
+    );
+    // Still sent as it is on the wire.
+    assert_eq!(
+        serde_json::to_value(&key).unwrap(),
+        serde_json::json!("cd".repeat(16))
+    );
+}
+
+#[test]
 fn a_lease_never_shows_in_debug_output() {
     let lease = LeaseKey::from_bytes([0xab; 16]);
     let shown = format!("{lease:?} {:?}", Some(lease.clone()));

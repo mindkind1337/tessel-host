@@ -224,12 +224,24 @@ pub struct Cancel {
 /// A message as it travels: a kind, and a body checked by whoever handles that kind. A
 /// message of a kind the receiver does not know is refused with an error, not a dropped
 /// connection, so a newer peer can be told plainly.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Its `Debug` shows the kind only: a body can carry a lease, a deduplication key, typed input
+/// or a file's contents, which must not end up in a log, a panic or a trace.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawMessage {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub body: Value,
+}
+
+impl std::fmt::Debug for RawMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawMessage")
+            .field("kind", &self.kind)
+            .field("body", &format_args!("<hidden>"))
+            .finish()
+    }
 }
 
 impl RawMessage {

@@ -22,7 +22,10 @@ macro_rules! token {
             }
         }
     };
-    // A capability: its value never appears in Debug output (logs, panics, traces).
+    // A capability: its value never appears in Debug output (logs, panics, traces). That is
+    // all this promises: the value is not wiped from memory when dropped, and the copies made
+    // by parsing, serializing and cloning stay until their memory is reused. Keep such values
+    // encrypted at rest and out of logs; do not rely on them vanishing from the process.
     (secret $(#[$doc:meta])* $name:ident, $what:literal) => {
         token!(@define $(#[$doc])* $name, $what);
         impl std::fmt::Debug for $name {
@@ -76,9 +79,11 @@ token!(
     "stream id"
 );
 token!(
+    secret
     /// Chosen by the client for an operation with an effect (creating a terminal), so a retry
     /// after a lost reply, even over a new connection, finds the first outcome instead of
-    /// doing it again.
+    /// doing it again. A capability while the daemon keeps that outcome: sending it again
+    /// returns the terminal and its lease. Its `Debug` hides it, like `LeaseKey`.
     DedupKey,
     "deduplication key"
 );

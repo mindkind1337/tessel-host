@@ -27,6 +27,13 @@ Client (`tessel-host-client`), no daemon change:
   dead link held) no longer lets go of the terminal its successor follows: the rejection and the
   letting go happen under the same lock as a new generation, for the current one only.
 
+- `DedupKey` is a secret like `LeaseKey`: its `Debug` shows `DedupKey(<hidden>)`. Sending it again
+  within the daemon's time returns the terminal and its lease, so it must not reach a log.
+- `RawMessage`'s `Debug` shows the kind only, never the body, which can carry a lease, a
+  deduplication key, typed input or a file's contents. Frames that contain messages inherit
+  this. Nothing changes on the wire. Hiding a value from `Debug` does not wipe it from
+  memory: keep such values encrypted at rest.
+
 ## 0.1.1
 
 Daemon and protocol:
