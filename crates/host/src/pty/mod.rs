@@ -486,7 +486,8 @@ impl Terminals {
         }
     }
 
-    pub fn ack(&self, peer: u64, ack: &Ack) -> Result<(), WireError> {
+    /// Ok(false): not a terminal stream.
+    pub fn ack(&self, peer: u64, ack: &Ack) -> Result<bool, WireError> {
         let mut state = self.lock();
         for term in state.terms.values_mut() {
             if let Some(a) = term
@@ -498,11 +499,10 @@ impl Terminals {
                     refuse_with(ErrorCode::BadFrame, "acknowledgment of an event never sent")
                 })?;
                 term.pump();
-                return Ok(());
+                return Ok(true);
             }
         }
-        // A stream detached or closed meanwhile: nothing to do.
-        Ok(())
+        Ok(false)
     }
 
     pub fn detach(&self, peer: u64, request: &Detach) -> Result<(), WireError> {

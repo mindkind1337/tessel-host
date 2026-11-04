@@ -3,8 +3,8 @@
 The wire contract between a Tessel client (the Rust desktop, later the Vue app) and
 `tessel-host` on a remote machine. `src/` implements it; `tests/fixtures/` holds one golden
 frame of each shape; `tests/wire.rs` checks the rules below and `tests/fuzz.rs` fuzzes them.
-Terminal messages are below; the bodies of tree, git and editor messages come with their gates
-(4 to 6).
+Terminal and file tree messages are below; the bodies of editor and git messages come with their
+gates (5 and 6).
 
 ## Frames
 
@@ -167,6 +167,46 @@ Requests and their replies (`src/pty.rs` has every field):
 - Terminals need a frame budget of at least 96 KiB (a 64 KiB chunk in base64 with its envelope);
   below that, `create` and `attach` are refused with `bad_request`.
 
+## File trees (capability `tree`)
+
+| request | reply | what it does |
+| --- | --- | --- |
+| `root.open` | `root.opened` | resolves an absolute directory once; the same directory gives the same root |
+| `tree.subscribe` | `tree.subscribed` | starts this connection's stream of changes for a root |
+| `tree.unsubscribe` | `done` | ends it |
+| `tree.expand` | `tree.listing` | lists a directory below the root and keeps it current |
+| `tree.collapse` | `done` | stops keeping a directory and those below it current for this connection |
+| `tree.stats` | `tree.stats_ok` | directory reads so far, watches, directories cached, the watch limit |
+
+- Paths below a root are opened name by name with `O_NOFOLLOW` from the root's descriptor: a
+  symbolic link is listed as `symlink` and never entered, even one swapped in after an
+  expansion (`bad_request`). A directory that cannot be read is `permission_denied`, never an
+  empty listing.
+- An expanded directory is watched before it is read, and the read happens under the lock the
+  event reader needs, so nothing that changes in between is lost; queued events are applied
+  after it by looking at each name again, which changes nothing the read already saw.
+- A listing carries the root's `revision`. `tree.changed` events of that directory with a higher
+  revision apply on top (they may arrive before the listing: keep them). A large change comes as
+  several events, each with its own revision. Entries carry raw names (base64), a `label` for
+  people, `kind`, `size` and `mtime_ms`.
+- Expanding a directory again, from any connection, reads the cache, not the disk; `tree.stats`
+  counts every directory read so this can be checked.
+- Exclusions (`root.opened` lists them: `node_modules`, `.git/objects`, `.cache`,
+  `__pycache__`, `.venv`, `target`) are listed with `excluded: true`, and expanding one reads it
+  on demand, unwatched. So does a directory beyond the watch limit (a quarter of
+  `fs.inotify.max_user_watches`, at most 8192, and the open-file limit) and one too large for a
+  listing (`truncated: true`). Such listings say `watched: false`: expanding again reads again.
+  Nothing uncovered is ever shown as empty or complete, and nothing polls.
+- When the kernel drops events (inotify overflow), every cached directory is read again (at most
+  512), its differences are sent, then `tree.resynced`. Directories beyond that are dropped
+  with `tree.stale` (`overflow`): expand them again.
+- A client whose window is full loses its tree events rather than holding the daemon; once it
+  has acknowledged what it was sent it gets `tree.stale` for the whole root (`lagging`) and
+  expands again, from the cache.
+- Directories stay cached while some connection keeps them expanded; a removed or moved
+  directory takes its cache and watch with it.
+- File trees need a frame budget of at least 16 KiB (`bad_request` below that).
+
 ## Errors
 
 | code | meaning | retryable |
@@ -213,3 +253,7 @@ A client reads a code it does not know as `unknown`.
 | `terminal.input` without the lease | after hello | reply `permission_denied` |
 | `terminal.input` with an `input_id` already applied | after hello | `duplicate: true`, not typed |
 | `terminal.create` or `attach` under a 96 KiB frame budget | after hello | reply `bad_request` |
+| `tree.expand` through a symbolic link | after hello | reply `bad_request` |
+| `tree.expand` of an unreadable directory | after hello | reply `permission_denied` |
+| `tree.expand` of an excluded directory, or beyond the watch limit | after hello | listing with `watched: false` |
+| `tree.subscribe` or `expand` under a 16 KiB frame budget | after hello | reply `bad_request` |

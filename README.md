@@ -20,9 +20,9 @@ versions of Tessel and has its own releases.
 
 ## Status
 
-Gates 1 (protocol), 2 (daemon, bridge, rootless installer, static builds) and 3 (terminals that
-outlive the connection, with replay or a snapshot on reattach) are done. The tree watcher, the
-editor, git and desktop integration follow. Nothing here replaces
+Gates 1 (protocol), 2 (daemon, bridge, rootless installer, static builds) , 3 (terminals that
+outlive the connection, with replay or a snapshot on reattach) and 4 (file trees kept current
+with inotify, from a cache) are done. The editor, git and desktop integration follow. Nothing here replaces
 tmux or the JavaScript helper on a host yet.
 
 ## Build and test (Linux)

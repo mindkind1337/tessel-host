@@ -4,18 +4,19 @@ use crate::log::Log;
 use crate::outbound::Outbound;
 use crate::pty::{Peer, Terminals};
 use crate::runtime::{Runtime, bind, is_this_user, peer_uid, random_bytes, runtime, try_lock};
+use crate::tree::Trees;
 use std::io::{self, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use tessel_host_protocol::pty;
 use tessel_host_protocol::{
     Budgets, Capability, ClientFrame, Connection, Epoch, ErrorCode, HostFrame, HostInfo,
     HostLimits, MAX_FRAME_BYTES, PersistenceMethod, RawMessage, ReplyMessage, Step, StreamId,
     WireError, encode_frame, read_frame, wire_error,
 };
+use tessel_host_protocol::{pty, tree};
 
 const MAX_CLIENTS: usize = 16;
 /// A connection that has not said hello by then is closed; after hello there is no limit.
@@ -150,7 +151,7 @@ fn run(
     let budgets = Budgets::SLOW_HOST;
     let shared = Arc::new(Shared {
         limits: HostLimits {
-            capabilities: vec![Capability::Pty],
+            capabilities: vec![Capability::Pty, Capability::Tree],
             budgets,
             epoch: epoch.clone(),
             info: HostInfo {
@@ -161,8 +162,10 @@ fn run(
             },
         },
         terminals: Terminals::new(epoch, budgets.total_ring_bytes as usize),
+        trees: Trees::new()?,
         next_peer: AtomicU64::new(1),
     });
+    crate::tree::raise_file_limit();
     handle_termination(
         shared.terminals.clone(),
         runtime.socket.clone(),
@@ -205,6 +208,7 @@ fn run(
 struct Shared {
     limits: HostLimits,
     terminals: Arc<Terminals>,
+    trees: Arc<Trees>,
     next_peer: AtomicU64,
 }
 
@@ -234,6 +238,20 @@ fn handle_termination(terminals: Arc<Terminals>, socket: std::path::PathBuf, log
 
 fn encode(frame: &HostFrame, limit: usize) -> Option<Vec<u8>> {
     encode_frame(frame, limit).ok()
+}
+
+/// Tree events hold at least one entry with a long name and its envelope.
+const MIN_TREE_FRAME_BYTES: usize = 16 * 1024;
+
+fn tree_frame(peer: &Peer) -> Result<(), WireError> {
+    if peer.frame_limit >= MIN_TREE_FRAME_BYTES {
+        Ok(())
+    } else {
+        Err(WireError::detail(
+            ErrorCode::BadRequest,
+            "the frame budget is too small for file trees",
+        ))
+    }
 }
 
 fn done() -> RawMessage {
@@ -295,6 +313,30 @@ fn handle(
             ErrorCode::BadRequest,
             "this message has no body",
         )),
+        tree::kind::ROOT_OPEN => message
+            .body_as::<tree::RootOpen>()
+            .and_then(|request| shared.trees.open_root(request))
+            .map(|opened| RawMessage::of(tree::kind::ROOT_OPENED, &opened)),
+        tree::kind::SUBSCRIBE => tree_frame(peer)
+            .and_then(|()| message.body_as::<tree::Subscribe>())
+            .and_then(|request| shared.trees.subscribe(request, peer))
+            .map(|subscribed| RawMessage::of(tree::kind::SUBSCRIBED, &subscribed)),
+        tree::kind::UNSUBSCRIBE => message
+            .body_as::<tree::Unsubscribe>()
+            .and_then(|request| shared.trees.unsubscribe(peer.id, &request))
+            .map(|()| done()),
+        tree::kind::EXPAND => tree_frame(peer)
+            .and_then(|()| message.body_as::<tree::Expand>())
+            .and_then(|request| shared.trees.expand(request, peer))
+            .map(|listing| RawMessage::of(tree::kind::LISTING, &listing)),
+        tree::kind::COLLAPSE => message
+            .body_as::<tree::Collapse>()
+            .and_then(|request| shared.trees.collapse(request, peer.id))
+            .map(|()| done()),
+        tree::kind::STATS => message
+            .body_as::<tree::Stats>()
+            .and_then(|request| shared.trees.stats(request))
+            .map(|stats| RawMessage::of(tree::kind::STATS_OK, &stats)),
         _ => Err(WireError::new(ErrorCode::UnsupportedKind)),
     };
     (reply, None)
@@ -348,7 +390,12 @@ fn client(stream: UnixStream, shared: &Shared) {
                 }
             }
             Ok(Step::Ack(ack)) => {
-                if let Err(refusal) = shared.terminals.ack(id, &ack) {
+                let routed = match shared.terminals.ack(id, &ack) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => shared.trees.ack(id, &ack),
+                    Err(refusal) => Err(refusal),
+                };
+                if let Err(refusal) = routed {
                     if let Some(bytes) = encode(&HostFrame::connection_error(refusal), limit) {
                         out.control(bytes);
                     }
@@ -380,6 +427,7 @@ fn client(stream: UnixStream, shared: &Shared) {
         }
     }
     shared.terminals.disconnect(id);
+    shared.trees.disconnect(id);
     out.end();
     let _ = writer.join();
     let _ = reader.shutdown(Shutdown::Both);

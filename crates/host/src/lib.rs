@@ -19,6 +19,8 @@ pub mod persistence;
 pub mod pty;
 #[cfg(target_os = "linux")]
 pub mod runtime;
+#[cfg(target_os = "linux")]
+pub mod tree;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

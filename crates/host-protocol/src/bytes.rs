@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for Chunk {
 /// be UTF-8, and a lossy conversion would name another file. Never absolute, never "." or
 /// "..", never a "/" or NUL inside a name. Empty means the root itself. A label for people
 /// to read is a separate field wherever one is shown.
-#[derive(Clone, Debug, PartialEq, Eq, Default, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
 pub struct RelPath(Vec<Vec<u8>>);
 
 fn valid_component(name: &[u8]) -> bool {
@@ -72,7 +72,53 @@ fn valid_component(name: &[u8]) -> bool {
         && !name.contains(&0)
 }
 
+/// One name in a directory, as its raw bytes (base64 on the wire).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Name(Vec<u8>);
+
+impl Name {
+    pub fn new(bytes: Vec<u8>) -> Option<Self> {
+        valid_component(&bytes).then_some(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// For people to read: invalid UTF-8 shown as U+FFFD. Never use it to find the file.
+    pub fn label(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+}
+
+impl Serialize for Name {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Name {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        decode_bounded(&text, MAX_COMPONENT_BYTES)
+            .and_then(Name::new)
+            .ok_or_else(|| serde::de::Error::custom("invalid name"))
+    }
+}
+
 impl RelPath {
+    /// This path with `name` below it.
+    pub fn child(&self, name: &Name) -> Option<Self> {
+        let mut components = self.0.clone();
+        components.push(name.0.clone());
+        Self::from_components(components)
+    }
+
+    /// Whether `self` is `other` or below it.
+    pub fn starts_with(&self, other: &RelPath) -> bool {
+        self.0.starts_with(&other.0)
+    }
+
     pub fn root() -> Self {
         Self(Vec::new())
     }

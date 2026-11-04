@@ -76,3 +76,8 @@ token!(
     LeaseKey,
     "lease"
 );
+token!(
+    /// A directory opened as a root, valid within the epoch.
+    RootId,
+    "root id"
+);

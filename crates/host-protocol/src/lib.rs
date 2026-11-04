@@ -10,10 +10,11 @@ mod frame;
 mod ids;
 pub mod pty;
 mod stream;
+pub mod tree;
 mod wire;
 
 pub use bytes::{
-    Chunk, MAX_CHUNK_BYTES, MAX_COMPONENT_BYTES, MAX_PATH_BYTES, MAX_PATH_COMPONENTS, RelPath,
+    Chunk, MAX_CHUNK_BYTES, MAX_COMPONENT_BYTES, MAX_PATH_BYTES, MAX_PATH_COMPONENTS, Name, RelPath,
 };
 pub use connection::{Connection, Dispatch, Fatal, HostLimits, InFlight, Step};
 pub use dedup::{Dedup, DedupCache};
@@ -21,7 +22,7 @@ pub use frame::{
     Frame, MAX_FRAME_BYTES, MAX_JSON_DEPTH, decode_payload, encode_frame, frame_length, read_frame,
     wire_error, write_frame,
 };
-pub use ids::{DedupKey, Epoch, LeaseKey, MAX_ID, StreamId, TerminalId};
+pub use ids::{DedupKey, Epoch, LeaseKey, MAX_ID, RootId, StreamId, TerminalId};
 pub use stream::{Ack, AckError, Arrival, SendError, StreamPos, StreamReceiver, StreamSender};
 pub use wire::{
     Budgets, Cancel, Capability, ClientFrame, ClientMessage, ErrorCode, Hello, HelloOk, HostFrame,

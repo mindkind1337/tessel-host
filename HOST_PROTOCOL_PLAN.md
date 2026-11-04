@@ -1,6 +1,6 @@
 # Native remote host plan
 
-Status: gates 1 to 3 implemented (below); gates 4 to 7 to come. Target: Linux
+Status: gates 1 to 4 implemented (below); gates 5 to 7 to come. Target: Linux
 x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
 No changes to the running Electron checkout. This is part of full Tessel parity,
 not a replacement for the remaining desktop work.
@@ -88,6 +88,32 @@ reconnect found the same daemon epoch and child pid, replayed from the barrier,
 and the 6,000 lines arrived exactly. Not verified: a real remote host and its
 logind policy, aarch64 terminals on real hardware, scrollback, the main screen
 behind an alternate screen (not in snapshots by design), and desktop rendering.
+
+Gate 4 (file trees) is complete: `crates/host/src/tree.rs` and the `tree`
+messages of `PROTOCOL.md`. Roots are resolved once and held as descriptors;
+paths are opened name by name with O_NOFOLLOW. Expanded directories are watched
+through /proc/self/fd (the directory actually opened) before being read, under
+the lock the event reader needs, and events are applied idempotently by looking
+at each name again. One inotify instance for the daemon; directories cached
+while a connection keeps them expanded, shared across connections; revisioned
+differences per subscription, split to fit frames; exclusions advertised and
+listed on demand; a watch limit from max_user_watches/4, 8192 and the file
+limit (raised to the hard limit), beyond which directories are listed on demand
+and say so; overflow followed by a bounded resync and `resynced`, or `stale`;
+lagging clients told to expand again rather than holding the daemon.
+Evidence (Ubuntu 24.04 WSL, Rust 1.99.1), 8 tests over the real bridge and the
+real file system, each run four times: creates, writes (new size), renames,
+deletes, mkdir, non-ASCII names, a subdirectory, and a removed directory taking
+its cache and watch; expanding again from either of two connections reading
+nothing (directory reads counted); a directory churned by 3,000 writes, deletes
+and renames while being expanded ending exactly like the disk; links listed and
+never entered, including one swapped in after expansion; an unreadable directory
+refused; exclusions and a watch limit of 2 reported as unwatched on-demand
+listings; 18,384 files created while the reader was held back (test-only delay)
+overflowing the kernel queue, followed by `resynced` and an exact tree; and
+unsubscribe and collapse. Not verified: a real host's tree sizes and limits, the
+300,000-file benchmark (gate 6, with git), network file systems (inotify does not
+see remote changes there), and desktop rendering.
 
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both

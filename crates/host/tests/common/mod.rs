@@ -16,6 +16,8 @@ pub const WAIT: Duration = Duration::from_secs(30);
 pub struct Home {
     pub path: PathBuf,
     pub daemons: Vec<u32>,
+    /// Given to the bridge, and so to a daemon it starts.
+    pub env: Vec<(String, String)>,
 }
 
 impl Home {
@@ -27,6 +29,7 @@ impl Home {
         Self {
             path,
             daemons: Vec::new(),
+            env: Vec::new(),
         }
     }
 
@@ -75,6 +78,7 @@ impl Client {
         let mut child = Command::new(EXE)
             .args(["connect", "--stdio"])
             .env("HOME", &home.path)
+            .envs(home.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -100,7 +104,7 @@ impl Client {
         };
         let hello = Hello {
             versions: vec![VERSION],
-            capabilities: vec!["pty".into()],
+            capabilities: vec!["pty".into(), "tree".into()],
             budgets,
         };
         let ok = client.request("hello", &hello).expect("hello");
