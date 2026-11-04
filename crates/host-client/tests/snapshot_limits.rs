@@ -495,3 +495,126 @@ fn a_replaced_stream_with_a_bad_snapshot_never_rejects_its_successor() {
     terminal.input(b"still mine").unwrap();
     client.close();
 }
+
+/// A daemon whose create succeeds and whose stream then sends a part out of order right after
+/// the attachment: the object lets go, possibly before `create_keyed` returns.
+struct CreateThenReject {
+    seen: Arc<Mutex<Seen>>,
+}
+
+impl Connector for CreateThenReject {
+    fn connect(&self) -> io::Result<Pipe> {
+        let (client_reader, mut daemon_writer) = io::pipe()?;
+        let (mut daemon_reader, client_writer) = io::pipe()?;
+        let seen = self.seen.clone();
+        std::thread::spawn(move || {
+            let mut send = |frame: HostFrame| {
+                write_frame(&mut daemon_writer, &frame, MAX_FRAME_BYTES)
+                    .and_then(|()| daemon_writer.flush())
+            };
+            let lease = LeaseKey::from_bytes([0x77; 16]);
+            while let Ok(Some(frame)) =
+                read_frame::<ClientFrame>(&mut daemon_reader, MAX_FRAME_BYTES)
+            {
+                let (Some(id), Some(message)) = (frame.request_id, frame.message) else {
+                    continue;
+                };
+                let answer = match message.kind.as_str() {
+                    "hello" => ReplyMessage::HelloOk(HelloOk {
+                        version: VERSION,
+                        capabilities: vec![Capability::Pty],
+                        budgets: Budgets::SLOW_HOST,
+                        host_epoch: Epoch::from_bytes(EPOCH),
+                    })
+                    .into_raw(),
+                    pty::kind::CREATE => RawMessage::of(
+                        pty::kind::CREATED,
+                        &tessel_host_protocol::pty::Created {
+                            terminal: TerminalId::from_bytes([4; 16]),
+                            pid: 1,
+                            lease: lease.clone(),
+                        },
+                    ),
+                    pty::kind::ATTACH => {
+                        seen.lock().unwrap().attaches += 1;
+                        let attached = Attached {
+                            stream: StreamId::from_bytes(STREAM),
+                            pid: 1,
+                            size: SIZE,
+                            mode: AttachMode::Replay,
+                            seq: 0,
+                            lease: Some(lease.clone()),
+                            last_input: Some(0),
+                        };
+                        if send(HostFrame::reply_ok(
+                            id,
+                            RawMessage::of(pty::kind::ATTACHED, &attached),
+                        ))
+                        .is_err()
+                        {
+                            return;
+                        }
+                        let bad = HostFrame::event(
+                            StreamPos {
+                                id: StreamId::from_bytes(STREAM),
+                                seq: 1,
+                            },
+                            part(3, true, SIZE, b"bad".to_vec()),
+                        );
+                        if send(bad).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    pty::kind::DETACH => {
+                        seen.lock().unwrap().detached += 1;
+                        ReplyMessage::Done.into_raw()
+                    }
+                    other => panic!("unexpected request {other}"),
+                };
+                if send(HostFrame::reply_ok(id, answer)).is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Pipe {
+            reader: Box::new(client_reader),
+            writer: Box::new(client_writer),
+            guard: None,
+        })
+    }
+}
+
+#[test]
+fn the_lease_a_create_granted_survives_a_stream_rejected_right_after() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let options = Options {
+        capabilities: vec!["pty"],
+        ..Options::default()
+    };
+    let client =
+        Client::connect(Box::new(CreateThenReject { seen: seen.clone() }), options).unwrap();
+    let created = Terminal::create_keyed(
+        &client,
+        tessel_host_protocol::DedupKey::from_bytes([0x12; 16]),
+        &Epoch::from_bytes(EPOCH),
+        vec!["sh".into()],
+        None,
+        Default::default(),
+        SIZE,
+    )
+    .unwrap();
+    assert_eq!(
+        created.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+        TerminalEvent::StreamRejected(StreamRejection::InvalidSnapshot)
+    );
+    // The object let go and types no more; the lease the create granted is still at hand.
+    assert_eq!(created.terminal.lease(), None);
+    assert_eq!(created.lease, LeaseKey::from_bytes([0x77; 16]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen.lock().unwrap().detached == 0 {
+        assert!(Instant::now() < deadline, "the attachment is let go");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    client.close();
+}

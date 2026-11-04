@@ -86,7 +86,9 @@ retry by themselves where that is safe, and say so otherwise.
 ```rust
 let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
 // or, to be able to recover a create whose reply was lost:
-let (terminal, events) = Terminal::create_keyed(&client, key, &epoch, argv, cwd, env, size)?;
+let created = Terminal::create_keyed(&client, key, &epoch, argv, cwd, env, size)?;
+// created.terminal, created.events, and created.lease: keep that lease (encrypted) even if
+// the object lets go right away; `terminal.lease()` alone says whether it types.
 ```
 
 - `create_keyed` takes a deduplication key the desktop draws (16 random bytes) and the epoch it
@@ -120,7 +122,7 @@ let (terminal, events) = Terminal::create_keyed(&client, key, &epoch, argv, cwd,
     output was skipped" marker.
   - `Exit`: show the end (code or signal). It comes once.
   - `LeaseLost`: another client took the terminal: read-only badge, a "Take over" action
-    (`terminal.take_lease()`, whose `Ok` means this client holds it again), keyboard input
+    (`terminal.take_lease()`, whose `Ok(lease)` means this client holds it again: keep that lease), keyboard input
     disabled.
   - `Disconnected`: "reconnecting" on the pane; keep what is shown. It always comes before
     `Reattached` or `Lost`, once per break.

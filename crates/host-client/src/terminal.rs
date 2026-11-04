@@ -231,6 +231,15 @@ struct Shared {
     lost: Mutex<bool>,
 }
 
+/// What `Terminal::create_keyed` answers: the terminal, its events, and the lease the create
+/// granted, which stays valid on the host whatever the object does afterwards (keep it to
+/// resume or end the program; `Terminal::lease()` alone says whether this object types).
+pub struct CreatedTerminal {
+    pub terminal: Terminal,
+    pub events: Receiver<TerminalEvent>,
+    pub lease: LeaseKey,
+}
+
 /// One terminal. Dropping it (or its event receiver) lets go of it: its attachment is detached
 /// on the host and it is never reattached, but the program goes on there, with its lease, so
 /// another `Terminal::attach_fresh` can pick it up later. Ending the program is `close`.
@@ -267,7 +276,8 @@ impl Terminal {
         size: Size,
     ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
         let epoch = client.epoch().ok_or(ClientError::ConnectionLost)?;
-        Self::create_keyed(client, random_key(), &epoch, argv, cwd, env, size)
+        let created = Self::create_keyed(client, random_key(), &epoch, argv, cwd, env, size)?;
+        Ok((created.terminal, created.events))
     }
 
     /// As `create`, with the deduplication key chosen and kept by the caller (16 random
@@ -290,6 +300,12 @@ impl Terminal {
     /// its keys and terminals are gone), this answers `EpochChanged` without sending anything.
     /// A daemon still creating the terminal for an earlier request answers `busy`; that is
     /// retried briefly.
+    ///
+    /// The answer carries the lease the create granted (`CreatedTerminal::lease`), apart from
+    /// the object: the object may let go before the caller looks at it (a snapshot it refused
+    /// right after attaching), and the lease must still be kept and usable to end the program
+    /// explicitly. If the create succeeded but the attachment after it failed, this answers
+    /// the attachment's error: the same key sent again finds the same terminal and lease.
     pub fn create_keyed(
         client: &Client,
         dedup: DedupKey,
@@ -298,7 +314,7 @@ impl Terminal {
         cwd: Option<String>,
         env: BTreeMap<String, String>,
         size: Size,
-    ) -> Result<(Self, Receiver<TerminalEvent>), ClientError> {
+    ) -> Result<CreatedTerminal, ClientError> {
         let request = Create {
             dedup,
             argv,
@@ -325,13 +341,19 @@ impl Terminal {
                 other => break other?,
             }
         };
-        Self::attach(
+        let lease = created.lease.clone();
+        let (terminal, events) = Self::attach(
             client,
             created.terminal,
             epoch.clone(),
             0,
             Some(created.lease),
-        )
+        )?;
+        Ok(CreatedTerminal {
+            terminal,
+            events,
+            lease,
+        })
     }
 
     /// Attaches to a terminal this pane still shows (after `after`, the last event it applied),
@@ -513,9 +535,11 @@ impl Terminal {
             .map(|_| ())
     }
 
-    /// Takes the lease from whoever holds it. `Ok` means this client holds it now; events go
-    /// on in order, from a new attachment that replaces the current one.
-    pub fn take_lease(&self) -> Result<(), ClientError> {
+    /// Takes the lease from whoever holds it, and returns it: keep that one (encrypted) to
+    /// resume or end the program later, even if this object lets go right after. `Ok` means
+    /// this client holds it now; events go on in order, from a new attachment that replaces
+    /// the current one. `lease()` stays the live authority to type.
+    pub fn take_lease(&self) -> Result<LeaseKey, ClientError> {
         let shared = &self.shared;
         let link = shared.client.link()?;
         // The current stream stops handing events over now (its own lease_lost included); the
@@ -534,7 +558,9 @@ impl Terminal {
             Ok(attached) => {
                 *shared.lease.lock().unwrap() = attached.lease.clone();
                 shared.start(&link, &attached, generation, false, false);
-                Ok(())
+                attached.lease.clone().ok_or(ClientError::Protocol(
+                    "the host granted no lease to a takeover".into(),
+                ))
             }
             Err(error) => {
                 // Back to following as before, on a new attachment of its own.

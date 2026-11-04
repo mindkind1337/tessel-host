@@ -27,6 +27,11 @@ Client (`tessel-host-client`), no daemon change:
   dead link held) no longer lets go of the terminal its successor follows: the rejection and the
   letting go happen under the same lock as a new generation, for the current one only.
 
+- `Terminal::create_keyed` answers a `CreatedTerminal { terminal, events, lease }`: the lease
+  the create granted comes with the answer, apart from the object, so it can still be kept and
+  used to end the program explicitly when the object lets go right away (a snapshot refused
+  just after attaching). `Terminal::take_lease` returns the lease it took. `lease()` stays the
+  live authority to type.
 - `DedupKey` is a secret like `LeaseKey`: its `Debug` shows `DedupKey(<hidden>)`. Sending it again
   within the daemon's time returns the terminal and its lease, so it must not reach a log.
 - `RawMessage`'s `Debug` shows the kind only, never the body, which can carry a lease, a

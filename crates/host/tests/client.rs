@@ -201,8 +201,12 @@ fn taking_the_lease_back_and_forth_keeps_each_side_in_order() {
     let (mut text_a, mut seen_a) = (Vec::new(), Vec::new());
     let (mut text_b, mut seen_b) = (Vec::new(), Vec::new());
 
-    terminal_b.take_lease().unwrap();
-    assert!(terminal_b.lease().is_some());
+    let taken = terminal_b.take_lease().unwrap();
+    assert_eq!(
+        terminal_b.lease(),
+        Some(taken),
+        "the lease it returns is the one it holds"
+    );
     text_until(&events_a, &mut text_a, &mut seen_a, |_, s| {
         s.contains(&TerminalEvent::LeaseLost)
     });
@@ -471,7 +475,7 @@ fn the_same_key_finds_the_terminal_a_lost_reply_created() {
     let epoch = first.epoch().unwrap();
     let key = tessel_host_protocol::DedupKey::from_bytes([0x5a; 16]);
     let size = Size { rows: 24, cols: 80 };
-    let (original, _events) = Terminal::create_keyed(
+    let original = Terminal::create_keyed(
         &first,
         key.clone(),
         &epoch,
@@ -482,7 +486,7 @@ fn the_same_key_finds_the_terminal_a_lost_reply_created() {
     )
     .unwrap();
     // The desktop never saw that reply; it sends the same key again.
-    let (again, _events_again) = Terminal::create_keyed(
+    let again = Terminal::create_keyed(
         &second,
         key,
         &epoch,
@@ -492,9 +496,13 @@ fn the_same_key_finds_the_terminal_a_lost_reply_created() {
         size,
     )
     .unwrap();
-    assert_eq!(again.id(), original.id());
-    assert_eq!(again.lease(), original.lease());
-    assert_eq!(again.pid, original.pid);
+    assert_eq!(again.terminal.id(), original.terminal.id());
+    assert_eq!(
+        again.lease, original.lease,
+        "the same lease, from the answer"
+    );
+    assert_eq!(again.terminal.lease(), Some(original.lease.clone()));
+    assert_eq!(again.terminal.pid, original.terminal.pid);
     let listed: tessel_host_protocol::pty::Listed = second
         .ask(
             tessel_host_protocol::pty::kind::LIST,
