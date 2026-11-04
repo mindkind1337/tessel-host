@@ -99,7 +99,9 @@ mod on_linux {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // A command that refuses before reading its input closes the pipe: that is an outcome,
+        // judged by its exit status, not a failure of the test.
+        let _ = child.stdin.take().unwrap().write_all(input);
         child.wait_with_output().unwrap()
     }
 
