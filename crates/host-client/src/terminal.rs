@@ -4,7 +4,8 @@
 //! daemon the terminal reattaches after the last event handed over and says `Reattached` before
 //! anything the new attachment sends, keeping its lease; on a restarted daemon it is `Lost`.
 //! Input is numbered here and retried with the same number through busy answers and
-//! reconnections, so it is typed exactly once.
+//! reconnections, so it is typed at most once: `Ok` means it was typed; an error after a
+//! reconnection that outlasted `request_timeout` means it may or may not have been.
 //!
 //! One stream at a time hands events over: a reattachment or a takeover starts a new
 //! generation, and whatever the replaced stream still holds (even an event waiting for the

@@ -117,8 +117,10 @@ let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
     attachment sends (replay or snapshot) comes after it; nothing from the old one does, even
     when your receiver was full at the time of the break.
   - `Lost`: the daemon restarted: the pane's program is gone; offer to start a new one.
-- `terminal.input(bytes)` types each byte exactly once, even across a reconnect or a busy
-  program (it retries with the same input number). Resize, signal and close need the lease.
+- `terminal.input(bytes)` types each input at most once, even across a reconnect or a busy
+  program (it retries with the same input number until `request_timeout`): `Ok` means typed; an
+  error after a reconnection that outlasted the timeout means it may or may not have been, so
+  say so rather than typing it again. Resize, signal and close need the lease.
 
 ## 5. File trees
 
