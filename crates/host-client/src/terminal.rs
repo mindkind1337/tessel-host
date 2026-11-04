@@ -1,22 +1,27 @@
-//! A terminal on the host, seen from the desktop. Events come in order, each applied once:
+//! A terminal on the host, seen from the desktop. Events come in order, each handed over once:
 //! output and resizes numbered by the terminal, a snapshot (all its parts joined) when history
 //! was dropped, the exit once. When the link breaks the events say `Disconnected`; on the same
-//! daemon the terminal reattaches after the last event it applied (`Reattached`), keeping its
-//! lease; on a restarted daemon it is `Lost`. Input is numbered here and retried with the same
-//! number through busy answers and reconnections, so it is typed exactly once.
+//! daemon the terminal reattaches after the last event handed over and says `Reattached` before
+//! anything the new attachment sends, keeping its lease; on a restarted daemon it is `Lost`.
+//! Input is numbered here and retried with the same number through busy answers and
+//! reconnections, so it is typed exactly once.
+//!
+//! One stream at a time hands events over: a reattachment or a takeover starts a new
+//! generation, and whatever the replaced stream still holds (even an event waiting for the
+//! application to read) is never handed over, so two streams can never interleave.
 use crate::link::{Link, StreamItem};
 use crate::{Client, ClientError, Resume};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tessel_host_protocol::pty::{
-    self, Attach, AttachMode, Attached, Close, Create, Created, Exit, Input, InputOk, LeaseLost,
-    Output, Resize, Resized, Signal, SignalRequest, Size, Snapshot, Writer,
+    self, Attach, AttachMode, Attached, Close, Create, Created, Detach, Exit, Input, InputOk,
+    LeaseLost, Output, Resize, Resized, Signal, SignalRequest, Size, Snapshot, Writer,
 };
 use tessel_host_protocol::{
-    Chunk, DedupKey, Epoch, ErrorCode, LeaseKey, MAX_CHUNK_BYTES, TerminalId,
+    Chunk, DedupKey, Epoch, ErrorCode, LeaseKey, MAX_CHUNK_BYTES, RawMessage, StreamId, TerminalId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,9 +45,9 @@ pub enum TerminalEvent {
     Exit(Exit),
     /// Another client took the lease: this one only watches now.
     LeaseLost,
-    /// The link broke; the terminal may still run on the host.
+    /// The link broke; the terminal may still run on the host. Always before `Reattached`.
     Disconnected,
-    /// Back on the same daemon: replay or snapshot follows.
+    /// Back on the same daemon: replay or snapshot follows, after this event.
     Reattached {
         mode: AttachMode,
         lease: bool,
@@ -51,12 +56,46 @@ pub enum TerminalEvent {
     Lost,
 }
 
+/// What has been handed to the application, and which stream may hand over more.
+struct Delivery {
+    /// Bumped when a stream is replaced (a reattachment, a takeover): only the follower of the
+    /// current generation hands events over.
+    generation: u64,
+    /// The last numbered event handed over: an output's or resize's `seq`, a snapshot's `at`.
+    last: u64,
+    /// The last connection event handed over was `Disconnected` (so `Reattached` follows one).
+    disconnected: bool,
+    exited: bool,
+    /// The current generation's stream, detached when a takeover replaces it.
+    stream: Option<StreamId>,
+}
+
+/// What handing an event over changes here.
+enum Effect {
+    Last(u64),
+    Exited,
+    Disconnected,
+    Reattached,
+    LeaseLost,
+    Nothing,
+}
+
+enum Delivered {
+    Sent,
+    /// Already handed over (a replayed event, a second exit, a second `Disconnected`).
+    Skipped,
+    /// A newer generation took over: this follower stops.
+    Stale,
+    /// The application dropped its receiver.
+    Closed,
+}
+
 struct Shared {
     client: Client,
     terminal: TerminalId,
     epoch: Mutex<Epoch>,
     lease: Mutex<Option<LeaseKey>>,
-    last: Mutex<u64>,
+    delivery: Mutex<Delivery>,
     next_input: AtomicU64,
     events: SyncSender<TerminalEvent>,
     lost: Mutex<bool>,
@@ -116,12 +155,21 @@ impl Terminal {
             terminal,
             epoch: Mutex::new(epoch),
             lease: Mutex::new(lease),
-            last: Mutex::new(after),
+            delivery: Mutex::new(Delivery {
+                generation: 0,
+                last: after,
+                disconnected: false,
+                exited: false,
+                stream: None,
+            }),
             next_input: AtomicU64::new(1),
             events,
             lost: Mutex::new(false),
         });
-        let attached = shared.attach(&client.link()?)?;
+        let link = client.link()?;
+        let had_lease = shared.lease.lock().unwrap().is_some();
+        let attached = shared.request_attach(&link, shared.writer())?;
+        shared.start(&link, &attached, 0, had_lease, false);
         client.register(Arc::downgrade(&shared) as std::sync::Weak<dyn Resume>);
         Ok((
             Self {
@@ -140,9 +188,12 @@ impl Terminal {
         self.shared.lease.lock().unwrap().clone()
     }
 
-    /// The last event applied (to attach again later, from another run of the desktop).
+    /// The last numbered event handed to the application (an output's or resize's `seq`, a
+    /// snapshot's `at`). It is not what the application has applied yet: events can wait in
+    /// its receiver. To attach again from another run of the desktop, keep the number of the
+    /// last event the UI actually applied, and pass that as `after`.
     pub fn last_seq(&self) -> u64 {
-        *self.shared.last.lock().unwrap()
+        self.shared.delivery.lock().unwrap().last
     }
 
     fn lease_or_refuse(&self) -> Result<LeaseKey, ClientError> {
@@ -233,140 +284,250 @@ impl Terminal {
             .map(|_| ())
     }
 
-    /// Takes the lease from whoever holds it.
+    /// Takes the lease from whoever holds it. `Ok` means this client holds it now; events go
+    /// on in order, from a new attachment that replaces the current one.
     pub fn take_lease(&self) -> Result<(), ClientError> {
-        let link = self.shared.client.link()?;
-        let mut lease = self.shared.lease.lock().unwrap();
-        let attached: Attached = link
-            .request(
-                tessel_host_protocol::RawMessage::of(
-                    pty::kind::ATTACH,
-                    &Attach {
-                        terminal: self.shared.terminal.clone(),
-                        epoch: self.shared.epoch.lock().unwrap().clone(),
-                        after: self.last_seq(),
-                        writer: Writer::Take,
-                    },
-                ),
-                self.shared.client.options().request_timeout,
-            )?
-            .body_as()
-            .map_err(ClientError::Refused)?;
-        *lease = attached.lease.clone();
-        drop(lease);
-        // A second stream would duplicate events: this attachment replaces the first.
-        self.shared.follow(&link, attached.stream);
-        Ok(())
+        let shared = &self.shared;
+        let link = shared.client.link()?;
+        // The current stream stops handing events over now (its own lease_lost included); the
+        // new attachment replays everything after the last event handed over.
+        let generation = shared.next_generation();
+        let replaced = shared.delivery.lock().unwrap().stream.clone();
+        let result = shared.request_attach(&link, Writer::Take);
+        let attached = match result {
+            Ok(attached) => {
+                *shared.lease.lock().unwrap() = attached.lease.clone();
+                shared.start(&link, &attached, generation, false, false);
+                Ok(())
+            }
+            Err(error) => {
+                // Back to following as before, on a new attachment of its own.
+                let generation = shared.next_generation();
+                let had_lease = shared.lease.lock().unwrap().is_some();
+                if let Ok(attached) = shared.request_attach(&link, shared.writer()) {
+                    shared.start(&link, &attached, generation, had_lease, false);
+                }
+                Err(error)
+            }
+        };
+        if let Some(stream) = replaced {
+            shared.detach(&link, stream);
+        }
+        attached
+    }
+}
+
+/// What a stream's message means to the application, if anything (a snapshot part that is not
+/// the last one is kept until the last arrives).
+fn translate(message: &RawMessage, parts: &mut Vec<Snapshot>) -> Option<TerminalEvent> {
+    match message.kind.as_str() {
+        pty::kind::OUTPUT => {
+            let output: Output = message.body_as().ok()?;
+            Some(TerminalEvent::Output {
+                seq: output.seq,
+                data: output.data.into_bytes(),
+            })
+        }
+        pty::kind::RESIZED => {
+            let resized: Resized = message.body_as().ok()?;
+            Some(TerminalEvent::Resized {
+                seq: resized.seq,
+                size: resized.size,
+            })
+        }
+        pty::kind::SNAPSHOT => {
+            let part: Snapshot = message.body_as().ok()?;
+            let done = part.last;
+            parts.push(part);
+            if !done {
+                return None;
+            }
+            let all = std::mem::take(parts);
+            let first = &all[0];
+            Some(TerminalEvent::Snapshot {
+                at: first.at,
+                size: first.size,
+                alternate: first.alternate,
+                resync: first.resync,
+                data: all
+                    .iter()
+                    .flat_map(|p| p.data.as_bytes().to_vec())
+                    .collect(),
+            })
+        }
+        pty::kind::EXIT => message.body_as::<Exit>().ok().map(TerminalEvent::Exit),
+        pty::kind::LEASE_LOST => {
+            let _: LeaseLost = message.body_as().ok()?;
+            Some(TerminalEvent::LeaseLost)
+        }
+        _ => None,
     }
 }
 
 impl Shared {
-    fn attach(self: &Arc<Self>, link: &Arc<Link>) -> Result<Attached, ClientError> {
-        let writer = match self.lease.lock().unwrap().clone() {
+    fn writer(&self) -> Writer {
+        match self.lease.lock().unwrap().clone() {
             Some(lease) => Writer::Resume(lease),
             None => Writer::None,
-        };
+        }
+    }
+
+    /// Starts a new generation: from here, only a follower started with the number returned
+    /// hands events over.
+    fn next_generation(&self) -> u64 {
+        let mut delivery = self.delivery.lock().unwrap();
+        delivery.generation += 1;
+        delivery.generation
+    }
+
+    fn current(&self, generation: u64) -> bool {
+        self.delivery.lock().unwrap().generation == generation
+    }
+
+    /// Attaches after the last event handed over.
+    fn request_attach(&self, link: &Arc<Link>, writer: Writer) -> Result<Attached, ClientError> {
         let request = Attach {
             terminal: self.terminal.clone(),
             epoch: self.epoch.lock().unwrap().clone(),
-            after: *self.last.lock().unwrap(),
+            after: self.delivery.lock().unwrap().last,
             writer,
         };
-        let attached: Attached = link
-            .request(
-                tessel_host_protocol::RawMessage::of(pty::kind::ATTACH, &request),
-                self.client.options().request_timeout,
-            )?
-            .body_as()
-            .map_err(ClientError::Refused)?;
-        let had = self.lease.lock().unwrap().is_some();
-        if had && attached.lease.is_none() {
-            *self.lease.lock().unwrap() = None;
-            let _ = self.events.send(TerminalEvent::LeaseLost);
-        }
-        self.follow(link, attached.stream.clone());
-        Ok(attached)
+        link.request(
+            RawMessage::of(pty::kind::ATTACH, &request),
+            self.client.options().request_timeout,
+        )?
+        .body_as()
+        .map_err(ClientError::Refused)
     }
 
-    /// Delivers a stream's events in order, once each, acknowledging each once delivered.
-    fn follow(self: &Arc<Self>, link: &Arc<Link>, stream: tessel_host_protocol::StreamId) {
+    /// Stops an attachment nobody follows any more (best effort: the link may be gone).
+    fn detach(&self, link: &Arc<Link>, stream: StreamId) {
+        link.unregister(&stream);
+        let _ = link.request(
+            RawMessage::of(pty::kind::DETACH, &Detach { stream }),
+            self.client.options().request_timeout,
+        );
+    }
+
+    /// Hands over what the attachment says (a lease that did not come back, `Reattached`), then
+    /// follows its stream as `generation`. Does nothing more if a newer generation took over.
+    fn start(
+        self: &Arc<Self>,
+        link: &Arc<Link>,
+        attached: &Attached,
+        generation: u64,
+        had_lease: bool,
+        reattached: bool,
+    ) {
+        let stale = |delivered| matches!(delivered, Delivered::Stale);
+        if had_lease
+            && attached.lease.is_none()
+            && stale(self.deliver(generation, TerminalEvent::LeaseLost))
+        {
+            return self.detach(link, attached.stream.clone());
+        }
+        if reattached
+            && stale(self.deliver(
+                generation,
+                TerminalEvent::Reattached {
+                    mode: attached.mode,
+                    lease: attached.lease.is_some(),
+                },
+            ))
+        {
+            return self.detach(link, attached.stream.clone());
+        }
+        {
+            let mut delivery = self.delivery.lock().unwrap();
+            if delivery.generation != generation {
+                drop(delivery);
+                return self.detach(link, attached.stream.clone());
+            }
+            delivery.stream = Some(attached.stream.clone());
+        }
+        self.follow(link, attached.stream.clone(), generation);
+    }
+
+    /// Hands `event` to the application, in order and once. Only the current generation hands
+    /// events over; an output or resize at or before the last one handed over, a second exit
+    /// and a second `Disconnected` are skipped; `last` moves only with what was handed over.
+    /// The check and the hand-over happen under one lock without ever blocking in it: when the
+    /// application has not read its events, this waits outside the lock and tries again.
+    fn deliver(&self, generation: u64, mut event: TerminalEvent) -> Delivered {
+        let mut pause = Duration::from_millis(1);
+        loop {
+            {
+                let mut delivery = self.delivery.lock().unwrap();
+                if delivery.generation != generation {
+                    return Delivered::Stale;
+                }
+                let skip = match &event {
+                    TerminalEvent::Output { seq, .. } | TerminalEvent::Resized { seq, .. } => {
+                        *seq <= delivery.last
+                    }
+                    TerminalEvent::Exit(_) => delivery.exited,
+                    TerminalEvent::Disconnected => delivery.disconnected,
+                    _ => false,
+                };
+                if skip {
+                    return Delivered::Skipped;
+                }
+                let effect = match &event {
+                    TerminalEvent::Output { seq, .. } | TerminalEvent::Resized { seq, .. } => {
+                        Effect::Last(*seq)
+                    }
+                    TerminalEvent::Snapshot { at, .. } => Effect::Last(*at),
+                    TerminalEvent::Exit(_) => Effect::Exited,
+                    TerminalEvent::Disconnected => Effect::Disconnected,
+                    TerminalEvent::Reattached { .. } => Effect::Reattached,
+                    TerminalEvent::LeaseLost => Effect::LeaseLost,
+                    TerminalEvent::Lost => Effect::Nothing,
+                };
+                match self.events.try_send(event) {
+                    Ok(()) => {
+                        match effect {
+                            Effect::Last(seq) => delivery.last = seq,
+                            Effect::Exited => delivery.exited = true,
+                            Effect::Disconnected => delivery.disconnected = true,
+                            Effect::Reattached => delivery.disconnected = false,
+                            Effect::LeaseLost => *self.lease.lock().unwrap() = None,
+                            Effect::Nothing => {}
+                        }
+                        return Delivered::Sent;
+                    }
+                    Err(TrySendError::Full(back)) => event = back,
+                    Err(TrySendError::Disconnected(_)) => return Delivered::Closed,
+                }
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+    }
+
+    /// Hands a stream's events over in order, once each, acknowledging each once handed over
+    /// (so a slow application holds the host back instead of piling events up here).
+    fn follow(self: &Arc<Self>, link: &Arc<Link>, stream: StreamId, generation: u64) {
         let receiver = link.register(&stream);
         let me = self.clone();
         let link = link.clone();
         std::thread::spawn(move || {
             let mut parts: Vec<Snapshot> = Vec::new();
             for StreamItem { seq, message } in receiver {
-                if let Some(event) = me.translate(&message, &mut parts)
-                    && me.events.send(event).is_err()
-                {
-                    break;
+                if let Some(event) = translate(&message, &mut parts) {
+                    match me.deliver(generation, event) {
+                        Delivered::Sent | Delivered::Skipped => {}
+                        Delivered::Stale | Delivered::Closed => {
+                            link.unregister(&stream);
+                            return;
+                        }
+                    }
                 }
                 link.ack(&stream, seq);
             }
             if !link.alive() {
-                let _ = me.events.send(TerminalEvent::Disconnected);
+                let _ = me.deliver(generation, TerminalEvent::Disconnected);
             }
         });
-    }
-
-    fn translate(
-        &self,
-        message: &tessel_host_protocol::RawMessage,
-        parts: &mut Vec<Snapshot>,
-    ) -> Option<TerminalEvent> {
-        let mut last = self.last.lock().unwrap();
-        match message.kind.as_str() {
-            pty::kind::OUTPUT => {
-                let output: Output = message.body_as().ok()?;
-                if output.seq <= *last {
-                    return None;
-                }
-                *last = output.seq;
-                Some(TerminalEvent::Output {
-                    seq: output.seq,
-                    data: output.data.into_bytes(),
-                })
-            }
-            pty::kind::RESIZED => {
-                let resized: Resized = message.body_as().ok()?;
-                if resized.seq <= *last {
-                    return None;
-                }
-                *last = resized.seq;
-                Some(TerminalEvent::Resized {
-                    seq: resized.seq,
-                    size: resized.size,
-                })
-            }
-            pty::kind::SNAPSHOT => {
-                let part: Snapshot = message.body_as().ok()?;
-                let done = part.last;
-                parts.push(part);
-                if !done {
-                    return None;
-                }
-                let all = std::mem::take(parts);
-                let first = &all[0];
-                *last = first.at;
-                Some(TerminalEvent::Snapshot {
-                    at: first.at,
-                    size: first.size,
-                    alternate: first.alternate,
-                    resync: first.resync,
-                    data: all
-                        .iter()
-                        .flat_map(|p| p.data.as_bytes().to_vec())
-                        .collect(),
-                })
-            }
-            pty::kind::EXIT => message.body_as::<Exit>().ok().map(TerminalEvent::Exit),
-            pty::kind::LEASE_LOST => {
-                let _: LeaseLost = message.body_as().ok()?;
-                *self.lease.lock().unwrap() = None;
-                Some(TerminalEvent::LeaseLost)
-            }
-            _ => None,
-        }
     }
 }
 
@@ -377,28 +538,48 @@ impl Resume for Shared {
 }
 
 impl Shared {
+    /// Called by the supervisor on each new link. The generation starts here, in the order
+    /// of the links; the rest runs on a thread of its own, so an application slow to read
+    /// this terminal's events never holds back the other sessions.
     pub(crate) fn resume_arc(self: &Arc<Self>, client: &Client, same_epoch: bool) {
         if *self.lost.lock().unwrap() {
             return;
         }
-        if !same_epoch {
-            *self.lost.lock().unwrap() = true;
-            let _ = self.events.send(TerminalEvent::Lost);
+        let generation = self.next_generation();
+        let link = client.link().ok();
+        let me = self.clone();
+        std::thread::spawn(move || me.reattach(link, generation, same_epoch));
+    }
+
+    fn reattach(self: &Arc<Self>, link: Option<Arc<Link>>, generation: u64, same_epoch: bool) {
+        // The replaced stream may have stopped before saying it: `Disconnected` always comes
+        // before `Reattached` or `Lost`.
+        if matches!(
+            self.deliver(generation, TerminalEvent::Disconnected),
+            Delivered::Stale | Delivered::Closed
+        ) {
             return;
         }
-        let Ok(link) = client.link() else { return };
-        match self.attach(&link) {
+        if !same_epoch {
+            *self.lost.lock().unwrap() = true;
+            let _ = self.deliver(generation, TerminalEvent::Lost);
+            return;
+        }
+        let Some(link) = link else { return };
+        let had_lease = self.lease.lock().unwrap().is_some();
+        match self.request_attach(&link, self.writer()) {
             Ok(attached) => {
-                let _ = self.events.send(TerminalEvent::Reattached {
-                    mode: attached.mode,
-                    lease: attached.lease.is_some(),
-                });
+                if self.current(generation) {
+                    self.start(&link, &attached, generation, had_lease, true);
+                } else {
+                    self.detach(&link, attached.stream);
+                }
             }
             Err(ClientError::Refused(e))
                 if e.code == ErrorCode::NotFound || e.code == ErrorCode::EpochMismatch =>
             {
                 *self.lost.lock().unwrap() = true;
-                let _ = self.events.send(TerminalEvent::Lost);
+                let _ = self.deliver(generation, TerminalEvent::Lost);
             }
             Err(_) => {}
         }

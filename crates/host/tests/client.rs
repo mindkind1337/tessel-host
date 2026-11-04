@@ -81,6 +81,171 @@ fn contains(text: &[u8], needle: &str) -> bool {
     text.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
 
+/// The application reads nothing for a while: its receiver fills up and the terminal's
+/// follower waits with an event in hand, while the link (whose own buffer still has room) sees
+/// the cut and reconnects. Then the application reads everything: one `Disconnected`, then
+/// `Reattached`, then the rest; every output once, in order, and nothing from the replaced
+/// stream after `Reattached`.
+#[test]
+fn a_cut_while_the_application_is_not_reading_keeps_every_event_in_order() {
+    let mut home = Home::new("clientsat");
+    let (client, connector) = connect(&mut home);
+    // One line every 3 ms: about one output event each, more than the application's receiver
+    // holds (256), fewer than that plus the link's buffer (256 more).
+    let script =
+        "i=1; while [ $i -le 400 ]; do echo \"line $i\"; i=$((i+1)); sleep 0.003; done; cat";
+    let (_terminal, events) = Terminal::create(
+        &client,
+        vec!["/bin/sh".into(), "-c".into(), script.into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let epoch = client.epoch().unwrap();
+    // Not reading: the receiver fills while the program prints.
+    std::thread::sleep(Duration::from_secs(3));
+    cut(&connector);
+    wait_for("the reconnection", || {
+        client.link().is_ok()
+            && client.state()
+                == ConnectionState::Connected {
+                    epoch: epoch.clone(),
+                }
+    });
+    // Let the replaced follower and the reattachment race for the receiver a moment.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut all = Vec::new();
+    let mut text = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    while !contains(&text, "line 400\r\n") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "timed out; {} bytes", text.len());
+        if let Ok(event) = events.recv_timeout(left) {
+            if let TerminalEvent::Output { data, .. } = &event {
+                text.extend_from_slice(data);
+            }
+            all.push(event);
+        }
+    }
+    let got = String::from_utf8_lossy(&text);
+    let lines: Vec<&str> = got.split("\r\n").filter(|l| !l.is_empty()).collect();
+    let misplaced = lines
+        .iter()
+        .enumerate()
+        .find(|(i, line)| **line != format!("line {}", i + 1));
+    assert!(
+        misplaced.is_none() && lines.len() == 400,
+        "every line once, in order: {} lines, first out of place {misplaced:?}",
+        lines.len()
+    );
+
+    let mut last = 0;
+    for event in &all {
+        if let TerminalEvent::Output { seq, .. } | TerminalEvent::Resized { seq, .. } = event {
+            assert!(*seq > last, "seq {seq} after {last}");
+            last = *seq;
+        }
+    }
+    let connection: Vec<(usize, &TerminalEvent)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !matches!(e, TerminalEvent::Output { .. }))
+        .collect();
+    assert_eq!(
+        connection.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+        vec![
+            &TerminalEvent::Disconnected,
+            &TerminalEvent::Reattached {
+                mode: AttachMode::Replay,
+                lease: true
+            }
+        ],
+        "one Disconnected, then Reattached"
+    );
+    assert_eq!(
+        connection[1].0,
+        connection[0].0 + 1,
+        "nothing between Disconnected and Reattached"
+    );
+    client.close();
+}
+
+fn count(text: &[u8], needle: &str) -> usize {
+    text.windows(needle.len())
+        .filter(|w| *w == needle.as_bytes())
+        .count()
+}
+
+/// Two clients pass the lease back and forth: each takeover replaces the taker's attachment
+/// without a gap or a repeat, the other side is told, and only the holder types.
+#[test]
+fn taking_the_lease_back_and_forth_keeps_each_side_in_order() {
+    let mut home = Home::new("clientlease");
+    let (a, _connector_a) = connect(&mut home);
+    let (b, _connector_b) = connect(&mut home);
+    let (terminal_a, events_a) = Terminal::create(
+        &a,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let epoch = a.epoch().unwrap();
+    let (terminal_b, events_b) =
+        Terminal::attach(&b, terminal_a.id().clone(), epoch, 0, None).unwrap();
+    assert!(terminal_b.lease().is_none());
+
+    let (mut text_a, mut seen_a) = (Vec::new(), Vec::new());
+    let (mut text_b, mut seen_b) = (Vec::new(), Vec::new());
+
+    terminal_b.take_lease().unwrap();
+    assert!(terminal_b.lease().is_some());
+    text_until(&events_a, &mut text_a, &mut seen_a, |_, s| {
+        s.contains(&TerminalEvent::LeaseLost)
+    });
+    assert!(terminal_a.lease().is_none());
+    assert!(
+        terminal_a.input(b"refused\n").is_err(),
+        "a watcher cannot type"
+    );
+    terminal_b.input(b"from b\n").unwrap();
+    for (events, text, seen) in [
+        (&events_a, &mut text_a, &mut seen_a),
+        (&events_b, &mut text_b, &mut seen_b),
+    ] {
+        text_until(events, text, seen, |t, _| count(t, "from b") >= 2);
+    }
+
+    terminal_a.take_lease().unwrap();
+    text_until(&events_b, &mut text_b, &mut seen_b, |_, s| {
+        s.contains(&TerminalEvent::LeaseLost)
+    });
+    terminal_a.input(b"from a\n").unwrap();
+    for (events, text, seen) in [
+        (&events_a, &mut text_a, &mut seen_a),
+        (&events_b, &mut text_b, &mut seen_b),
+    ] {
+        text_until(events, text, seen, |t, _| count(t, "from a") >= 2);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    for (events, text) in [(&events_a, &mut text_a), (&events_b, &mut text_b)] {
+        while let Ok(event) = events.try_recv() {
+            if let TerminalEvent::Output { data, .. } = event {
+                text.extend_from_slice(&data);
+            }
+        }
+        // The echo and cat's copy, once each: no replay repeated by a takeover.
+        assert_eq!(count(text, "from b"), 2);
+        assert_eq!(count(text, "from a"), 2);
+        assert_eq!(count(text, "refused"), 0);
+    }
+    a.close();
+    b.close();
+}
+
 #[test]
 fn a_cut_link_reconnects_and_the_terminal_continues_exactly() {
     let mut home = Home::new("clientcut");

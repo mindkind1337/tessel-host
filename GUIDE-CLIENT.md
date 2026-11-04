@@ -87,9 +87,11 @@ retry by themselves where that is safe, and say so otherwise.
 let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
 ```
 
-- Keep `terminal.id()`, `client.epoch()` and `terminal.last_seq()` with the pane: after a restart
-  of the desktop, `Terminal::attach(&client, id, epoch, last_seq, lease)` continues where it was
-  (or says `Lost`). The lease is a capability (whoever has it types into the terminal): keep it
+- Keep `terminal.id()`, `client.epoch()` and the number of the last event the pane actually
+  applied (an `Output`'s or `Resized`'s `seq`, a `Snapshot`'s `at`) with the pane: after a
+  restart of the desktop, `Terminal::attach(&client, id, epoch, applied, lease)` continues where
+  it was (or says `Lost`). `terminal.last_seq()` is the last event handed to your receiver, not
+  necessarily applied yet: do not persist it as the pane's position. The lease is a capability (whoever has it types into the terminal): keep it
   in memory, or encrypted with the desktop's secrets if it must outlive a restart; never in the
   workspace file, a backup or a log (`LeaseKey`'s `Debug` hides it). Without it, attach as a
   watcher and take the lease (`take_lease`).
@@ -103,9 +105,13 @@ let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
     output was skipped" marker.
   - `Exit`: show the end (code or signal). It comes once.
   - `LeaseLost`: another client took the terminal: read-only badge, a "Take over" action
-    (`terminal.take_lease()`), keyboard input disabled.
-  - `Disconnected`: "reconnecting" on the pane; keep what is shown.
-  - `Reattached { mode, lease }`: back; `lease: false` means read-only now.
+    (`terminal.take_lease()`, whose `Ok` means this client holds it again), keyboard input
+    disabled.
+  - `Disconnected`: "reconnecting" on the pane; keep what is shown. It always comes before
+    `Reattached` or `Lost`, once per break.
+  - `Reattached { mode, lease }`: back; `lease: false` means read-only now. Everything the new
+    attachment sends (replay or snapshot) comes after it; nothing from the old one does, even
+    when your receiver was full at the time of the break.
   - `Lost`: the daemon restarted: the pane's program is gone; offer to start a new one.
 - `terminal.input(bytes)` types each byte exactly once, even across a reconnect or a busy
   program (it retries with the same input number). Resize, signal and close need the lease.
