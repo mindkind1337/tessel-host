@@ -14,7 +14,7 @@ pub mod terminal;
 pub mod tree;
 
 pub use command::CommandConnector;
-pub use link::{Connector, Link, Pipe, StreamItem};
+pub use link::{Connector, Link, Opening, Pipe, StreamItem};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -83,6 +83,10 @@ pub struct Options {
     pub budgets: Budgets,
     /// How long one request may wait for its answer.
     pub request_timeout: Duration,
+    /// How long one connection attempt may take, from opening the stream to the daemon's hello
+    /// (signing in over SSH and starting the daemon included). Beyond, the attempt is abandoned
+    /// and its process stopped: `Client::connect` answers `Timeout`, a reconnection tries again.
+    pub connect_timeout: Duration,
     /// Longest pause between two reconnection attempts.
     pub max_backoff: Duration,
 }
@@ -93,6 +97,7 @@ impl Default for Options {
             capabilities: vec!["pty", "tree", "editor", "git"],
             budgets: Budgets::SLOW_HOST,
             request_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(20),
             max_backoff: Duration::from_secs(5),
         }
     }
@@ -105,9 +110,11 @@ pub(crate) trait Resume: Send + Sync {
 }
 
 pub(crate) struct Inner {
-    connector: Box<dyn Connector>,
+    connector: Arc<dyn Connector>,
     options: Options,
     link: Mutex<Option<Arc<Link>>>,
+    /// The reconnection attempt in progress, so `close` can abandon it.
+    opening: Mutex<Option<Arc<Opening>>>,
     state: Mutex<ConnectionState>,
     changed: Condvar,
     sessions: Mutex<Vec<Weak<dyn Resume>>>,
@@ -121,14 +128,23 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connects once (an error here is returned, not retried), then keeps the link up.
+    /// Connects once within `options.connect_timeout` (an error here is returned, not retried),
+    /// then keeps the link up.
     pub fn connect(connector: Box<dyn Connector>, options: Options) -> Result<Self, ClientError> {
-        let link = Link::open(&*connector, &options.capabilities, options.budgets)?;
+        let connector: Arc<dyn Connector> = Arc::from(connector);
+        let link = Link::open(
+            connector.clone(),
+            &options.capabilities,
+            options.budgets,
+            options.connect_timeout,
+            Arc::new(Opening::default()),
+        )?;
         let epoch = link.hello.host_epoch.clone();
         let inner = Arc::new(Inner {
             connector,
             options,
             link: Mutex::new(Some(link)),
+            opening: Mutex::new(None),
             state: Mutex::new(ConnectionState::Connected { epoch }),
             changed: Condvar::new(),
             sessions: Mutex::new(Vec::new()),
@@ -233,10 +249,15 @@ impl Client {
         sessions.push(session);
     }
 
-    /// Ends the link for good: the connection's process (if any) is stopped and the client
-    /// does not reconnect. Sessions on the host go on.
+    /// Ends the link for good: the connection's process (if any) is stopped, a reconnection in
+    /// progress is abandoned (its process stopped too), and the client does not reconnect.
+    /// Sessions on the host go on.
     pub fn close(&self) {
+        // Set first: the supervisor checks it under each lock taken below.
         self.inner.closed.store(true, Ordering::SeqCst);
+        if let Some(opening) = self.inner.opening.lock().unwrap().take() {
+            opening.cancel();
+        }
         if let Some(link) = self.inner.link.lock().unwrap().take() {
             link.shutdown();
         }
@@ -244,42 +265,94 @@ impl Client {
         self.inner.changed.notify_all();
     }
 
+    fn closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// A closed client stays `Closed`.
     fn set_state(&self, state: ConnectionState) {
-        *self.inner.state.lock().unwrap() = state;
+        let mut current = self.inner.state.lock().unwrap();
+        if self.closed() {
+            return;
+        }
+        *current = state;
+        drop(current);
         self.inner.changed.notify_all();
+    }
+
+    /// One connection attempt that `close` can abandon.
+    fn open_link(&self) -> Result<Arc<Link>, ClientError> {
+        let opening = Arc::new(Opening::default());
+        {
+            let mut slot = self.inner.opening.lock().unwrap();
+            if self.closed() {
+                return Err(ClientError::ConnectionLost);
+            }
+            *slot = Some(opening.clone());
+        }
+        let result = Link::open(
+            self.inner.connector.clone(),
+            &self.inner.options.capabilities,
+            self.inner.options.budgets,
+            self.inner.options.connect_timeout,
+            opening.clone(),
+        );
+        let mut slot = self.inner.opening.lock().unwrap();
+        if slot.as_ref().is_some_and(|o| Arc::ptr_eq(o, &opening)) {
+            *slot = None;
+        }
+        result
+    }
+
+    /// Waits `pause`, or less if the client is closed meanwhile.
+    fn backoff(&self, pause: Duration) {
+        let state = self.inner.state.lock().unwrap();
+        let _ = self
+            .inner
+            .changed
+            .wait_timeout_while(state, pause, |_| !self.closed())
+            .unwrap();
     }
 
     fn supervise(self) {
         loop {
             let Ok(link) = self.link() else { return };
             let _ = link.on_close().recv();
-            if self.inner.closed.load(Ordering::SeqCst) {
+            if self.closed() {
                 return;
             }
             let previous = link.hello.host_epoch.clone();
             let mut attempt = 0u32;
             let mut pause = Duration::from_millis(100);
             let fresh = loop {
+                if self.closed() {
+                    return;
+                }
                 attempt += 1;
                 self.set_state(ConnectionState::Reconnecting { attempt });
-                match Link::open(
-                    &*self.inner.connector,
-                    &self.inner.options.capabilities,
-                    self.inner.options.budgets,
-                ) {
+                match self.open_link() {
                     Ok(fresh) => break fresh,
                     Err(_) => {
-                        if self.inner.closed.load(Ordering::SeqCst) {
+                        if self.closed() {
                             return;
                         }
-                        std::thread::sleep(pause);
+                        self.backoff(pause);
                         pause = (pause * 2).min(self.inner.options.max_backoff);
                     }
                 }
             };
             let current = fresh.hello.host_epoch.clone();
             let same = current == previous;
-            *self.inner.link.lock().unwrap() = Some(fresh);
+            {
+                let mut slot = self.inner.link.lock().unwrap();
+                if self.closed() {
+                    // Closed while this link opened: it never becomes the client's.
+                    drop(slot);
+                    fresh.shutdown();
+                    return;
+                }
+                *slot = Some(fresh);
+            }
             self.set_state(if same {
                 ConnectionState::Connected { epoch: current }
             } else {

@@ -57,6 +57,10 @@ let client = Client::connect(Box::new(connector), Options::default())?;
 ```
 
 `Options` lists the capabilities wanted (`pty`, `tree`, `editor`, `git`) and the budgets.
+`connect_timeout` (20 s by default) bounds each connection attempt, from opening the channel to
+the daemon's hello: an SSH channel that stays up while the daemon never answers is abandoned and
+its process stopped (`Client::connect` answers `Timeout`; a reconnection tries again).
+`client.close()` also abandons a reconnection in progress; a closed client stays `Closed`.
 `client.hello()` says what the host granted; a capability not granted is not offered in the UI.
 Ask `host.info` once for `persistence.survives_logout`: show `no` and `unknown` as a warning next
 to terminals ("terminals end when you log out of this host" / "may end").

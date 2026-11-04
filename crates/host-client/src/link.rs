@@ -5,9 +5,9 @@ use crate::ClientError;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessel_host_protocol::{
     Ack, Budgets, ClientFrame, ClientMessage, Hello, HelloOk, HostFrame, MAX_FRAME_BYTES,
     RawMessage, ReplyMessage, StreamId, VERSION, read_frame, write_frame,
@@ -41,6 +41,53 @@ pub struct StreamItem {
 
 type Pending = HashMap<u64, Sender<Result<RawMessage, ClientError>>>;
 
+/// What the opening thread hands back: the agreement and both directions of the stream.
+type Opened = Result<(HelloOk, Box<dyn Read + Send>, Box<dyn Write + Send>), ClientError>;
+
+/// One connection being opened, so another thread can abandon it (`Client::close` during a
+/// reconnection): its guard is dropped, which ends a connect, read or write blocked on it.
+#[derive(Default)]
+pub struct Opening {
+    cancelled: AtomicBool,
+    guard: Mutex<Option<Box<dyn Send>>>,
+}
+
+impl Opening {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        drop(self.guard.lock().unwrap().take());
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Says hello and reads the answer, on the opening thread.
+fn handshake(
+    reader: &mut Box<dyn Read + Send>,
+    writer: &mut Box<dyn Write + Send>,
+    hello: Hello,
+) -> Result<HelloOk, ClientError> {
+    write_frame(
+        writer,
+        &ClientFrame::request(1, ClientMessage::Hello(hello)),
+        MAX_FRAME_BYTES,
+    )
+    .map_err(|e| ClientError::Io(e.to_string()))?;
+    writer.flush().map_err(|e| ClientError::Io(e.to_string()))?;
+    let reply = read_frame::<HostFrame>(reader, MAX_FRAME_BYTES)
+        .map_err(|e| ClientError::Io(e.to_string()))?
+        .ok_or(ClientError::ConnectionLost)?;
+    if let Some(error) = reply.error {
+        return Err(ClientError::Refused(error));
+    }
+    match reply.ok.as_ref().map(ReplyMessage::from_raw) {
+        Some(Ok(Some(ReplyMessage::HelloOk(agreed)))) if reply.reply_to == Some(1) => Ok(agreed),
+        _ => Err(ClientError::Protocol("no hello_ok".into())),
+    }
+}
+
 pub struct Link {
     writer: Mutex<Box<dyn Write + Send>>,
     pending: Mutex<Pending>,
@@ -55,41 +102,84 @@ pub struct Link {
 }
 
 impl Link {
-    /// Connects and says hello; `Err` if the host refused it or the stream failed.
+    /// Connects and says hello within `timeout`. `Err` if the host refused it, the stream failed,
+    /// nothing came in time (`Timeout`: an SSH channel can stay up with a daemon that never
+    /// answers), or `opening` was cancelled meanwhile (`ConnectionLost`).
+    ///
+    /// Connecting and the hello run on a thread of their own, so waiting for them is bounded
+    /// whatever the connector does. Giving up drops the connection's guard, which must end its
+    /// stream (`CommandConnector` kills its process); the thread then ends too.
     pub fn open(
-        connector: &dyn Connector,
+        connector: Arc<dyn Connector>,
         capabilities: &[&str],
         budgets: Budgets,
+        timeout: Duration,
+        opening: Arc<Opening>,
     ) -> Result<Arc<Self>, ClientError> {
-        let Pipe {
-            mut reader,
-            mut writer,
-            guard,
-        } = connector
-            .connect()
-            .map_err(|e| ClientError::Io(e.to_string()))?;
         let hello = Hello {
             versions: vec![VERSION],
             capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
             budgets,
         };
-        write_frame(
-            &mut writer,
-            &ClientFrame::request(1, ClientMessage::Hello(hello)),
-            MAX_FRAME_BYTES,
-        )
-        .map_err(|e| ClientError::Io(e.to_string()))?;
-        writer.flush().map_err(|e| ClientError::Io(e.to_string()))?;
-        let reply = read_frame::<HostFrame>(&mut reader, MAX_FRAME_BYTES)
-            .map_err(|e| ClientError::Io(e.to_string()))?
-            .ok_or(ClientError::ConnectionLost)?;
-        if let Some(error) = reply.error {
-            return Err(ClientError::Refused(error));
-        }
-        let agreed = match reply.ok.as_ref().map(ReplyMessage::from_raw) {
-            Some(Ok(Some(ReplyMessage::HelloOk(agreed)))) if reply.reply_to == Some(1) => agreed,
-            _ => return Err(ClientError::Protocol("no hello_ok".into())),
+        let (sender, receiver) = channel::<Opened>();
+        let worker = opening.clone();
+        std::thread::spawn(move || {
+            let Pipe {
+                mut reader,
+                mut writer,
+                guard,
+            } = match connector.connect() {
+                Ok(pipe) => pipe,
+                Err(e) => {
+                    let _ = sender.send(Err(ClientError::Io(e.to_string())));
+                    return;
+                }
+            };
+            {
+                let mut slot = worker.guard.lock().unwrap();
+                if worker.cancelled() {
+                    // Abandoned while connecting: the stream goes with its guard, here.
+                    return;
+                }
+                *slot = guard;
+            }
+            let result = handshake(&mut reader, &mut writer, hello);
+            let _ = sender.send(result.map(|agreed| (agreed, reader, writer)));
+        });
+
+        let deadline = Instant::now() + timeout;
+        let opened = loop {
+            if opening.cancelled() {
+                opening.cancel();
+                return Err(ClientError::ConnectionLost);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                opening.cancel();
+                return Err(ClientError::Timeout);
+            }
+            match receiver.recv_timeout(left.min(Duration::from_millis(50))) {
+                Ok(opened) => break opened,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    opening.cancel();
+                    return Err(ClientError::ConnectionLost);
+                }
+            }
         };
+        let (agreed, reader, writer) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                opening.cancel();
+                return Err(error);
+            }
+        };
+        let guard = opening.guard.lock().unwrap().take();
+        if opening.cancelled() {
+            // Cancelled between the hello and here: its guard is already gone.
+            drop(guard);
+            return Err(ClientError::ConnectionLost);
+        }
         let frame_limit = agreed.budgets.frame_bytes as usize;
         let link = Arc::new(Self {
             writer: Mutex::new(writer),
