@@ -131,8 +131,10 @@ let (terminal, events) = Terminal::create_keyed(&client, key, &epoch, argv, cwd,
   - `StreamRejected(reason)`: this terminal's stream sent a snapshot the client refuses. The
     reasons are `InvalidSnapshot` (parts out of order, disagreeing, interrupted or too many) and
     `OversizedSnapshot` (more than `MAX_SNAPSHOT_BYTES`, 16 MiB). It is the last event. The
-    object is let go: detached on the host, never reattached, and it no longer types; `close()`
-    still ends the program. The program and its lease stay on the host. Say so on the pane,
+    object is let go: detached on the host, never reattached, and it no longer types or closes.
+    The program and its lease stay on the host; to end it, offer an explicit, confirmed action
+    that calls `close_terminal(&client, &epoch, &id, &lease)` with the kept lease (no
+    attachment, so no snapshot is needed). Say so on the pane,
     with no automatic retry. The link and the other terminals go on. Apply a snapshot to your
     own screen in pieces per frame if you like; the client never holds more than 16 MiB of one.
 - `terminal.input(bytes)` types each input at most once, even across a reconnect or a busy

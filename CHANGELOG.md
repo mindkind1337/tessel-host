@@ -18,9 +18,14 @@ Client (`tessel-host-client`), no daemon change:
   `MAX_SNAPSHOT_BYTES` (16 MiB). Otherwise `TerminalEvent::StreamRejected` (`InvalidSnapshot`
   or `OversizedSnapshot`) ends this terminal's stream only: it is let go and never
   reattached, the link and the other terminals go on, nothing reconnects for it.
-- A terminal object that was let go (dropped receiver, rejected stream) no longer types:
-  `lease()` is `None` and input, resize and signal are refused. `close()` still ends the
-  program, and the lease stays valid on the host for a new, explicit attachment.
+- A terminal object that was let go (dropped receiver, rejected stream) no longer types or
+  closes: `lease()` is `None` and input, resize, signal and close are refused. The lease stays
+  valid on the host. `close_terminal(client, epoch, terminal, lease)` ends such a program
+  without attaching (no stream, no snapshot), from an explicit action; another epoch answers
+  `EpochChanged` without sending.
+- A stream rejected by an old follower (one replaced after a reconnection, still reading what its
+  dead link held) no longer lets go of the terminal its successor follows: the rejection and the
+  letting go happen under the same lock as a new generation, for the current one only.
 
 ## 0.1.1
 

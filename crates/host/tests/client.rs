@@ -408,7 +408,7 @@ fn dropping_only_the_receiver_lets_go_at_the_next_event() {
         Size { rows: 24, cols: 80 },
     )
     .unwrap();
-    let id = terminal.id().clone();
+    let (id, lease) = (terminal.id().clone(), terminal.lease().unwrap());
     drop(events);
     terminal.input(b"wake up\n").unwrap();
     wait_for("the attachment to go", || {
@@ -441,6 +441,22 @@ fn dropping_only_the_receiver_lets_go_at_the_next_event() {
         info.leased && info.exited.is_none(),
         "still running, still leased"
     );
+    // Ending it takes an explicit close with the kept lease, without attaching.
+    assert!(terminal.close().is_err());
+    tessel_host_client::terminal::close_terminal(&client, &epoch, &id, &lease).unwrap();
+    wait_for("the program to end", || {
+        let listed: tessel_host_protocol::pty::Listed = client
+            .ask(
+                tessel_host_protocol::pty::kind::LIST,
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+        listed
+            .terminals
+            .iter()
+            .find(|t| t.terminal == id)
+            .is_none_or(|t| t.exited.is_some())
+    });
     client.close();
 }
 

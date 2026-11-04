@@ -189,6 +189,15 @@ impl Delivery {
         self.generation += 1;
         Some(self.stream.take())
     }
+
+    /// Lets go, but only for `generation` while it is current: a replaced stream never gives
+    /// up the terminal its successor now follows.
+    fn abandon_current(&mut self, generation: u64) -> Option<Option<StreamId>> {
+        if !self.admits(generation) {
+            return None;
+        }
+        self.abandon()
+    }
 }
 
 /// What handing an event over changes here.
@@ -486,22 +495,13 @@ impl Terminal {
             .map(|_| ())
     }
 
-    /// Ends the program (hang-up, then a kill). Allowed even once this object was let go:
-    /// ending a program needs no screen, and a terminal whose screen this client refused to
-    /// apply could otherwise never be ended from here.
+    /// Ends the program (hang-up, then a kill). Refused once this object was let go; a
+    /// program whose terminal was let go is ended with `close_terminal`, from an explicit,
+    /// confirmed action.
     pub fn close(&self) -> Result<(), ClientError> {
-        let lease = self
-            .shared
-            .lease
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(ClientError::Refused(tessel_host_protocol::WireError::new(
-                ErrorCode::PermissionDenied,
-            )))?;
         let request = Close {
             terminal: self.shared.terminal.clone(),
-            lease,
+            lease: self.lease_or_refuse()?,
         };
         self.shared
             .client
@@ -556,8 +556,31 @@ impl Terminal {
     }
 }
 
-/// What a stream's message means to the application, if anything (a snapshot part that is not
-/// the last one is kept until the last arrives).
+/// Ends a terminal's program without attaching to it: no stream, no snapshot. For a terminal
+/// whose object was let go (a refused snapshot, a closed pane), from an explicit action the
+/// person confirmed, with the lease kept for it. Before each attempt the link must reach
+/// `epoch` (otherwise `EpochChanged`, nothing sent: a restarted daemon's terminals are gone);
+/// the daemon checks the lease (`PermissionDenied` if another client took it meanwhile).
+pub fn close_terminal(
+    client: &Client,
+    epoch: &Epoch,
+    terminal: &TerminalId,
+    lease: &LeaseKey,
+) -> Result<(), ClientError> {
+    let request = Close {
+        terminal: terminal.clone(),
+        lease: lease.clone(),
+    };
+    client
+        .retrying(|| {
+            if client.epoch().as_ref() != Some(epoch) {
+                return Err(ClientError::EpochChanged);
+            }
+            client.ask::<serde_json::Value>(pty::kind::CLOSE, &request)
+        })
+        .map(|_| ())
+}
+
 /// What a stream's message means to the application, if anything. Snapshot parts are checked
 /// one by one before they are kept (`Parts`); another event in the middle of a snapshot is
 /// refused, so a snapshot is never applied half-received.
@@ -676,6 +699,43 @@ impl Shared {
         let Some(stream) = self.delivery.lock().unwrap().abandon() else {
             return;
         };
+        self.let_go(stream);
+    }
+
+    /// Refuses the stream of `generation`: hands `StreamRejected` over and lets go, both in
+    /// the same critical section as a generation starting, so the rejection is always the last
+    /// event and a replaced stream (an old follower draining what its dead link still held)
+    /// can neither tell the application nor give up the terminal its successor follows.
+    /// Returns whether it was the current stream. Waits outside the lock while the application
+    /// has not read its events.
+    fn reject(&self, generation: u64, reason: StreamRejection) -> bool {
+        let mut pause = Duration::from_millis(1);
+        loop {
+            {
+                let mut delivery = self.delivery.lock().unwrap();
+                if !delivery.admits(generation) {
+                    return false;
+                }
+                match self.events.try_send(TerminalEvent::StreamRejected(reason)) {
+                    Ok(()) | Err(TrySendError::Disconnected(_)) => {
+                        let stream = delivery.abandon_current(generation);
+                        drop(delivery);
+                        if let Some(stream) = stream {
+                            self.let_go(stream);
+                        }
+                        return true;
+                    }
+                    Err(TrySendError::Full(_)) => {}
+                }
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(20));
+        }
+    }
+
+    /// Stops following `stream` and asks the daemon to drop the attachment, from a thread of
+    /// its own (never waits for the daemon).
+    fn let_go(&self, stream: Option<StreamId>) {
         let (Some(stream), Ok(link)) = (stream, self.client.link()) else {
             return;
         };
@@ -822,9 +882,14 @@ impl Shared {
                     Ok(event) => event,
                     Err(reason) => {
                         // Refused for this terminal only: told once, then let go. The link and
-                        // the other terminals go on; nothing reconnects for it.
-                        let _ = me.deliver(generation, TerminalEvent::StreamRejected(reason));
-                        return me.abandon();
+                        // the other terminals go on; nothing reconnects for it. The parts go
+                        // first: up to 16 MiB need not wait for the application to read.
+                        drop(std::mem::take(&mut parts));
+                        if !me.reject(generation, reason) {
+                            // A replaced stream: not this follower's terminal to give up.
+                            link.unregister(&stream);
+                        }
+                        return;
                     }
                 };
                 if let Some(event) = event {
@@ -927,6 +992,22 @@ mod tests {
             delivery.abandon().is_none(),
             "letting go twice does nothing"
         );
+    }
+
+    #[test]
+    fn a_replaced_generation_cannot_let_go_of_its_successor() {
+        let mut delivery = Delivery::new(0);
+        let old = delivery.begin().unwrap();
+        let current = delivery.begin().unwrap();
+        assert_eq!(
+            delivery.abandon_current(old),
+            None,
+            "the old follower is stale"
+        );
+        assert!(!delivery.abandoned);
+        assert!(delivery.admits(current), "the successor goes on");
+        assert!(delivery.abandon_current(current).is_some());
+        assert!(delivery.abandoned);
     }
 
     #[test]
