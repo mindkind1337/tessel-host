@@ -656,6 +656,26 @@ impl Trees {
         Ok(())
     }
 
+    /// A directory below a root, opened name by name without following links.
+    pub fn open_dir(&self, root: &RootId, components: &[Vec<u8>]) -> Result<OwnedFd, WireError> {
+        let mut fd = {
+            let state = self.lock();
+            let root = state
+                .roots
+                .get(root)
+                .ok_or_else(|| refuse(ErrorCode::NotFound, "unknown root"))?;
+            dup(root.fd.as_raw_fd()).map_err(|e| from_errno(&e))?
+        };
+        for name in components {
+            fd = openat_dir(fd.as_raw_fd(), name).map_err(|e| from_errno(&e))?;
+        }
+        Ok(fd)
+    }
+
+    pub fn root_path(&self, root: &RootId) -> Option<PathBuf> {
+        self.lock().roots.get(root).map(|r| r.path.clone())
+    }
+
     pub fn stats(&self, request: tree::Stats) -> Result<TreeStats, WireError> {
         let state = self.lock();
         let root = state

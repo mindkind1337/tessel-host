@@ -18,6 +18,8 @@ pub struct Home {
     pub daemons: Vec<u32>,
     /// Given to the bridge, and so to a daemon it starts.
     pub env: Vec<(String, String)>,
+    /// A whole command line to run instead of `tessel-host connect --stdio` (in a namespace).
+    pub wrap: Option<Vec<String>>,
 }
 
 impl Home {
@@ -30,6 +32,7 @@ impl Home {
             path,
             daemons: Vec::new(),
             env: Vec::new(),
+            wrap: None,
         }
     }
 
@@ -75,8 +78,19 @@ pub struct Client {
 
 impl Client {
     fn open(home: &Home, budgets: Budgets) -> Self {
-        let mut child = Command::new(EXE)
-            .args(["connect", "--stdio"])
+        let mut command = match &home.wrap {
+            Some(line) => {
+                let mut c = Command::new(&line[0]);
+                c.args(&line[1..]);
+                c
+            }
+            None => {
+                let mut c = Command::new(EXE);
+                c.args(["connect", "--stdio"]);
+                c
+            }
+        };
+        let mut child = command
             .env("HOME", &home.path)
             .envs(home.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
@@ -104,7 +118,7 @@ impl Client {
         };
         let hello = Hello {
             versions: vec![VERSION],
-            capabilities: vec!["pty".into(), "tree".into()],
+            capabilities: vec!["pty".into(), "tree".into(), "editor".into()],
             budgets,
         };
         let ok = client.request("hello", &hello).expect("hello");

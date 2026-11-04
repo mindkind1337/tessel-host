@@ -6,6 +6,7 @@
 mod bytes;
 mod connection;
 mod dedup;
+pub mod file;
 mod frame;
 mod ids;
 pub mod pty;
@@ -22,7 +23,9 @@ pub use frame::{
     Frame, MAX_FRAME_BYTES, MAX_JSON_DEPTH, decode_payload, encode_frame, frame_length, read_frame,
     wire_error, write_frame,
 };
-pub use ids::{DedupKey, Epoch, LeaseKey, MAX_ID, RootId, StreamId, TerminalId};
+pub use ids::{
+    DedupKey, Digest, Epoch, FileVersion, LeaseKey, MAX_ID, RootId, StreamId, TerminalId, UploadId,
+};
 pub use stream::{Ack, AckError, Arrival, SendError, StreamPos, StreamReceiver, StreamSender};
 pub use wire::{
     Budgets, Cancel, Capability, ClientFrame, ClientMessage, ErrorCode, Hello, HelloOk, HostFrame,

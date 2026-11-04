@@ -210,12 +210,9 @@ impl Connection {
                     reply(Err(WireError::new(ErrorCode::NotFound)))
                 }
             }
-            Ok(None) => match Capability::for_kind(&message.kind) {
-                None => reply(Err(WireError::new(ErrorCode::UnsupportedKind))),
-                Some(capability) if !negotiated.capabilities.contains(&capability) => {
-                    reply(Err(WireError::new(ErrorCode::CapabilityNotNegotiated)))
-                }
-                Some(capability) => match self.in_flight.begin(id) {
+            Ok(None) => match Capability::granted_for(&message.kind, &negotiated.capabilities) {
+                Err(code) => reply(Err(WireError::new(code))),
+                Ok(capability) => match self.in_flight.begin(id) {
                     Err(error) => reply(Err(error)),
                     Ok(()) => Ok(Step::Dispatch(Dispatch {
                         request_id: id,

@@ -43,6 +43,22 @@ impl Capability {
         }
     }
 
+    /// The negotiated capability that admits `kind`, or why none does. Roots serve both file
+    /// trees and the editor: `root.*` is admitted by either.
+    pub fn granted_for(kind: &str, negotiated: &[Capability]) -> Result<Capability, ErrorCode> {
+        let wanted = Self::for_kind(kind).ok_or(ErrorCode::UnsupportedKind)?;
+        let candidates: &[Capability] = if wanted == Self::Tree && kind.starts_with("root.") {
+            &[Self::Tree, Self::Editor]
+        } else {
+            &[wanted]
+        };
+        candidates
+            .iter()
+            .copied()
+            .find(|c| negotiated.contains(c))
+            .ok_or(ErrorCode::CapabilityNotNegotiated)
+    }
+
     /// The capability a request kind belongs to. None: a core message, or a kind no
     /// capability of this version knows.
     pub fn for_kind(kind: &str) -> Option<Self> {
@@ -463,6 +479,8 @@ pub enum ErrorCode {
     /// Someone else changed it first (a save over a newer file).
     Conflict,
     TooLarge,
+    /// No space left on the device, or the user's quota is used up.
+    NoSpace,
     /// The history needed to resume is gone: take a snapshot or start over.
     Gap,
     /// The host restarted since: what the client knew is gone.
@@ -493,6 +511,7 @@ impl ErrorCode {
             Self::PermissionDenied => "permission denied",
             Self::Conflict => "changed by someone else",
             Self::TooLarge => "too large",
+            Self::NoSpace => "no space left or quota exceeded",
             Self::Gap => "history no longer available",
             Self::EpochMismatch => "host restarted",
             Self::Timeout => "timed out",

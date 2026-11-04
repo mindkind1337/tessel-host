@@ -81,3 +81,47 @@ token!(
     RootId,
     "root id"
 );
+token!(
+    /// One version of a file: changes whenever the file does.
+    FileVersion,
+    "file version"
+);
+token!(
+    /// A save in progress.
+    UploadId,
+    "upload id"
+);
+
+/// The SHA-256 of some bytes, as 64 lowercase hexadecimal digits.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Digest(String);
+
+impl Digest {
+    pub fn parse(value: &str) -> Option<Self> {
+        (value.len() == 64
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| Self(value.to_owned()))
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        let mut text = String::with_capacity(64);
+        for byte in bytes {
+            let _ = write!(text, "{byte:02x}");
+        }
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| serde::de::Error::custom("invalid digest"))
+    }
+}

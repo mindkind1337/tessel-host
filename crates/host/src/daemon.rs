@@ -1,5 +1,6 @@
 //! `tessel-host serve`: accepts this user's connections on the private socket and answers them
 //! with the protocol. Threads, not an async runtime: a few clients, each with its own reader.
+use crate::files::Files;
 use crate::log::Log;
 use crate::outbound::Outbound;
 use crate::pty::{Peer, Terminals};
@@ -16,7 +17,7 @@ use tessel_host_protocol::{
     HostLimits, MAX_FRAME_BYTES, PersistenceMethod, RawMessage, ReplyMessage, Step, StreamId,
     WireError, encode_frame, read_frame, wire_error,
 };
-use tessel_host_protocol::{pty, tree};
+use tessel_host_protocol::{file, pty, tree};
 
 const MAX_CLIENTS: usize = 16;
 /// A connection that has not said hello by then is closed; after hello there is no limit.
@@ -149,9 +150,10 @@ fn run(
     let log = Arc::new(Log::new(runtime.log.clone()));
     let epoch = Epoch::from_bytes(random_bytes()?);
     let budgets = Budgets::SLOW_HOST;
+    let trees = Trees::new()?;
     let shared = Arc::new(Shared {
         limits: HostLimits {
-            capabilities: vec![Capability::Pty, Capability::Tree],
+            capabilities: vec![Capability::Pty, Capability::Tree, Capability::Editor],
             budgets,
             epoch: epoch.clone(),
             info: HostInfo {
@@ -162,7 +164,8 @@ fn run(
             },
         },
         terminals: Terminals::new(epoch, budgets.total_ring_bytes as usize),
-        trees: Trees::new()?,
+        files: Files::new(trees.clone(), runtime.dir.join("uploads")),
+        trees,
         next_peer: AtomicU64::new(1),
     });
     crate::tree::raise_file_limit();
@@ -209,6 +212,7 @@ struct Shared {
     limits: HostLimits,
     terminals: Arc<Terminals>,
     trees: Arc<Trees>,
+    files: Arc<Files>,
     next_peer: AtomicU64,
 }
 
@@ -337,6 +341,46 @@ fn handle(
             .body_as::<tree::Stats>()
             .and_then(|request| shared.trees.stats(request))
             .map(|stats| RawMessage::of(tree::kind::STATS_OK, &stats)),
+        file::kind::STAT => message
+            .body_as::<file::Stat>()
+            .and_then(|r| shared.files.stat(r))
+            .map(|info| RawMessage::of(file::kind::INFO, &info)),
+        file::kind::READ => message
+            .body_as::<file::Read>()
+            .and_then(|r| shared.files.read(r))
+            .map(|chunk| RawMessage::of(file::kind::CHUNK, &chunk)),
+        file::kind::WRITE_BEGIN => message
+            .body_as::<file::WriteBegin>()
+            .and_then(|r| shared.files.begin(r, peer))
+            .map(|upload| RawMessage::of(file::kind::UPLOAD, &upload)),
+        file::kind::WRITE_CHUNK => message
+            .body_as::<file::WriteChunk>()
+            .and_then(|r| shared.files.chunk(r, peer.id))
+            .map(|()| done()),
+        file::kind::WRITE_COMMIT => message
+            .body_as::<file::WriteCommit>()
+            .and_then(|r| shared.files.commit(r, peer.id))
+            .map(|written| RawMessage::of(file::kind::WRITTEN, &written)),
+        file::kind::WRITE_ABORT => message
+            .body_as::<file::WriteAbort>()
+            .and_then(|r| shared.files.abort(r, peer.id))
+            .map(|()| done()),
+        file::kind::COMPARE => message
+            .body_as::<file::Compare>()
+            .and_then(|r| shared.files.compare(r))
+            .map(|compared| RawMessage::of(file::kind::COMPARED, &compared)),
+        file::kind::RENAME => message
+            .body_as::<file::Rename>()
+            .and_then(|r| shared.files.rename(r))
+            .map(|()| done()),
+        file::kind::REMOVE => message
+            .body_as::<file::Remove>()
+            .and_then(|r| shared.files.remove(r))
+            .map(|()| done()),
+        file::kind::MKDIR => message
+            .body_as::<file::Mkdir>()
+            .and_then(|r| shared.files.mkdir(r))
+            .map(|()| done()),
         _ => Err(WireError::new(ErrorCode::UnsupportedKind)),
     };
     (reply, None)
@@ -428,6 +472,7 @@ fn client(stream: UnixStream, shared: &Shared) {
     }
     shared.terminals.disconnect(id);
     shared.trees.disconnect(id);
+    shared.files.disconnect(id);
     out.end();
     let _ = writer.join();
     let _ = reader.shutdown(Shutdown::Both);

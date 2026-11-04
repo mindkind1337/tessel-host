@@ -3,8 +3,7 @@
 The wire contract between a Tessel client (the Rust desktop, later the Vue app) and
 `tessel-host` on a remote machine. `src/` implements it; `tests/fixtures/` holds one golden
 frame of each shape; `tests/wire.rs` checks the rules below and `tests/fuzz.rs` fuzzes them.
-Terminal and file tree messages are below; the bodies of editor and git messages come with their
-gates (5 and 6).
+Terminal, file tree and editor messages are below; git messages come with gate 6.
 
 ## Frames
 
@@ -207,6 +206,44 @@ Requests and their replies (`src/pty.rs` has every field):
   directory takes its cache and watch with it.
 - File trees need a frame budget of at least 16 KiB (`bad_request` below that).
 
+## Editor (capability `editor`)
+
+Paths are below a root opened with `root.open` (admitted by either `tree` or `editor`).
+
+| request | reply | what it does |
+| --- | --- | --- |
+| `file.stat` | `file.info` | kind, size, modification time and `version` (never following a link) |
+| `file.read` | `file.chunk` | up to 64 KiB from an offset: original bytes, the file's size and version, `eof` |
+| `file.write_begin` | `file.upload` | starts a save of `size` bytes against a `base` (version and SHA-256 the client read); no base: a new file |
+| `file.write_chunk` | `done` | the next bytes, in order |
+| `file.write_commit` | `file.written` | makes the upload the file; its new version and SHA-256 |
+| `file.write_abort` | `done` | throws the upload away |
+| `file.compare` | `file.compared` | whether the file's content now has a given SHA-256 (the host hashes it) |
+| `file.rename` | `done` | renames without replacing: an existing destination is `conflict` |
+| `file.remove` | `done` | a file (only if still `version`, when given) or an empty directory (else `conflict`) |
+| `file.mkdir` | `done` | a new directory (`conflict` if anything is there) |
+
+- A `version` changes whenever the file does (its identity, size, and both times to the
+  nanosecond). Reading is a chunk per request, so a client stops when it likes; every chunk
+  carries the version, and a different one means the file changed: read it again.
+- Only regular files are read or saved; a symbolic link is never followed and a FIFO is refused
+  without waiting (`bad_request`).
+- A save is written to a temporary file in the same directory, created exclusively, with the
+  space reserved first, so a full disk or a used-up quota answers `no_space` before anything is
+  sent where the file system can tell. The file itself is never written in place: a failure at
+  any point removes the temporary file and leaves the file as it was, never truncated.
+- The base is checked when the save starts and again at the commit: the file must still be the
+  version read, or have the same content (a touch is not a change). A last look right before
+  the rename catches a change during the commit. Anything else is `conflict`, never a silent
+  overwrite. A new file is created with a rename that never replaces (a file created meanwhile
+  is `conflict`). The saved file keeps the mode of the one it replaces (new files: 0644); being
+  a new inode, it does not keep hard links or extended attributes.
+- At most 16 saves at once and 1 GiB reserved in all (`busy`); a file is at most 512 MiB
+  (`too_large`). An upload ends with its connection, or after 10 minutes without a chunk; a
+  client resends its buffer after reconnecting. Temporary files of a daemon that died are
+  removed by the next one, from a journal in its private runtime directory.
+- `compare` and a save's content check hash the file on the host, the same authority.
+
 ## Errors
 
 | code | meaning | retryable |
@@ -220,6 +257,7 @@ Requests and their replies (`src/pty.rs` has every field):
 | `busy` | too many requests or entries at once | yes |
 | `cancelled` | the request was cancelled | no |
 | `not_found`, `permission_denied`, `conflict`, `too_large` | as named; `conflict`: someone else changed it first | no |
+| `no_space` | no space left on the device, or the quota is used up | no |
 | `gap` | the history needed to resume is gone: take a snapshot or start over | no |
 | `epoch_mismatch` | the daemon restarted since | no |
 | `timeout` | took too long | yes |
@@ -257,3 +295,6 @@ A client reads a code it does not know as `unknown`.
 | `tree.expand` of an unreadable directory | after hello | reply `permission_denied` |
 | `tree.expand` of an excluded directory, or beyond the watch limit | after hello | listing with `watched: false` |
 | `tree.subscribe` or `expand` under a 16 KiB frame budget | after hello | reply `bad_request` |
+| `root.open` with only `editor` granted | after hello | `root.opened` |
+| `file.write_commit` after the file changed on disk | after hello | reply `conflict`; the file is the other writer's |
+| `file.write_begin` or `chunk` on a full disk | after hello | reply `no_space`; no temporary file, the file intact |

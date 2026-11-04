@@ -1,6 +1,6 @@
 # Native remote host plan
 
-Status: gates 1 to 4 implemented (below); gates 5 to 7 to come. Target: Linux
+Status: gates 1 to 5 implemented (below); gates 6 and 7 to come. Target: Linux
 x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
 No changes to the running Electron checkout. This is part of full Tessel parity,
 not a replacement for the remaining desktop work.
@@ -114,6 +114,31 @@ overflowing the kernel queue, followed by `resynced` and an exact tree; and
 unsubscribe and collapse. Not verified: a real host's tree sizes and limits, the
 300,000-file benchmark (gate 6, with git), network file systems (inotify does not
 see remote changes there), and desktop rendering.
+
+Gate 5 (editor) is complete: `crates/host/src/files.rs` and the `editor`
+messages of `PROTOCOL.md`. Files are opened from their directory's descriptor
+with O_NOFOLLOW (and O_NONBLOCK until known to be regular); reads are a chunk
+per request carrying the file's version; saves go to an exclusive temporary
+file in the same directory with the space reserved first, are checked against
+the base (version, else SHA-256) at the start and the commit, with a last look
+before the rename (renameat2 RENAME_NOREPLACE for new files), keep the mode and
+fsync the file and the directory. Rename, remove and mkdir never replace.
+Uploads end with their connection or after 10 idle minutes; a journal lets the
+next daemon remove a dead daemon's temporary files.
+Evidence (Ubuntu 24.04 WSL, Rust 1.99.1), 7 tests over the real bridge, three
+runs: 200 kB of binary noise read back exactly and a 300 kB save keeping mode
+0640 with nothing left behind; a file changed on disk after the read refused at
+the start, a file changed during the upload refused at the commit (the other
+writer's bytes kept), a touch without change accepted; a new file never
+replacing one created meanwhile; a full disk both injected mid-write (test knob)
+and real (a 256 KiB tmpfs in a user namespace refusing at the reservation),
+each leaving neither a temporary nor a truncated file; an upload interrupted by
+a killed connection removed, then resent whole; an idle upload removed; a
+SIGKILLed daemon's temporary file removed by the next daemon; compare, rename,
+remove and mkdir refusing to replace; a link and a FIFO refused without
+blocking. Not verified: a real quota (EDQUOT has the same path as ENOSPC), a
+real host's file systems (network ones, noexec, no fallocate), files near the
+512 MiB limit, and desktop dirty-buffer handling (gate 7).
 
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both

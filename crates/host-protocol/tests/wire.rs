@@ -661,3 +661,32 @@ fn host_info_only_after_hello() {
         Some(ErrorCode::BadRequest)
     );
 }
+
+#[test]
+fn roots_are_admitted_by_the_tree_or_the_editor_capability() {
+    let admitted = |granted: &[Capability], kind: &str| Capability::granted_for(kind, granted);
+    assert_eq!(
+        admitted(&[Capability::Editor], "root.open"),
+        Ok(Capability::Editor)
+    );
+    assert_eq!(
+        admitted(&[Capability::Tree, Capability::Editor], "root.open"),
+        Ok(Capability::Tree)
+    );
+    assert_eq!(
+        admitted(&[Capability::Pty], "root.open"),
+        Err(ErrorCode::CapabilityNotNegotiated)
+    );
+    assert_eq!(
+        admitted(&[Capability::Editor], "tree.expand"),
+        Err(ErrorCode::CapabilityNotNegotiated)
+    );
+    assert_eq!(
+        admitted(&[Capability::Editor], "file.read"),
+        Ok(Capability::Editor)
+    );
+    assert_eq!(
+        admitted(&[Capability::Editor], "future.thing"),
+        Err(ErrorCode::UnsupportedKind)
+    );
+}
