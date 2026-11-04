@@ -57,7 +57,8 @@ with rust-lld), refuses a dependency on a desktop toolkit, web view or JavaScrip
 that each ELF file is static for its machine, and writes `manifest.json` and `SHA256SUMS`.
 `accept` runs each program: version, daemon, bridge, hello, host information, a killed bridge and
 the same daemon afterwards; a foreign architecture runs under a user-mode emulator. CI does both
-on every push and keeps `dist/` as an artifact.
+on every push and keeps `dist/` as an artifact. A tag `v<version>` (the crates' version) publishes
+them as a GitHub release; what changed in each one is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Using the protocol from Tessel
 

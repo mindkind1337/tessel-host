@@ -35,4 +35,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "tessel-host $GITHUB_REF_NAME" \
-            --notes "Static tessel-host for Linux x86_64 and aarch64 (musl), with manifest.json, SHA256SUMS and LICENSE. Built, tested and run (aarch64 emulated) by CI from $GITHUB_SHA."
+            --notes "Static tessel-host for Linux x86_64 and aarch64 (musl), with manifest.json, SHA256SUMS and LICENSE. Built, tested and run (aarch64 emulated) by CI from $GITHUB_SHA. Changes: CHANGELOG.md at this tag."

@@ -220,6 +220,15 @@ and a conflict refused with the host's file untouched. Not verified: Windows
 at run time (CI checks it builds and its unit tests pass), a real SSH client
 as the connector inside the desktop, and the desktop panels themselves.
 
+Release 0.1.1 (after reviews during the desktop integration; see CHANGELOG.md):
+the link's opening is bounded and cancellable, a terminal's events come from
+one stream at a time (a cut while the application was not reading failed 3 out
+of 3 before and passes now), `terminal.attach` without `after` starts with the
+current screen, and `last_input` lets a lease kept across a desktop restart type
+again (before, its inputs were taken for repeats and silently dropped). Evidence
+(WSL and Windows): the client tests over the real daemon (6), the terminal tests
+(16), fake-daemon tests for the link's opening (6) and the lease numbering (4).
+
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both
 consume it and it has its own releases and CI. tessel-rust depends on a pinned

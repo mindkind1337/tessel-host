@@ -1,6 +1,6 @@
 [package]
 name = "tessel-host-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Client of the Tessel host daemon: one link over any byte stream, reconnection, typed sessions"

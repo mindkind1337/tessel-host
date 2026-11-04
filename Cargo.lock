@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "tessel-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "tessel-host-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "tessel-host-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "serde",
@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "tessel-host-xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "tessel-host",
