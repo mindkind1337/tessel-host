@@ -150,11 +150,10 @@ impl Editor {
         base: Option<Base>,
         bytes: &[u8],
     ) -> Result<Written, SaveError> {
-        let mut attempts = 0;
+        let deadline = std::time::Instant::now() + self.client.options().request_timeout;
         loop {
-            attempts += 1;
             match self.save_once(path, base.clone(), bytes) {
-                Err(ClientError::ConnectionLost) if attempts < 4 => {
+                Err(ClientError::ConnectionLost) if std::time::Instant::now() < deadline => {
                     if !self
                         .client
                         .wait_connected(self.client.options().request_timeout)

@@ -232,6 +232,9 @@ impl Link {
             )
             .and_then(|()| writer.flush());
             if sent.is_err() {
+                // The other end is gone: no request goes through this link any more, even
+                // before its reader sees the end.
+                self.alive.store(false, Ordering::SeqCst);
                 self.pending.lock().unwrap().remove(&id);
                 return Err(ClientError::ConnectionLost);
             }
