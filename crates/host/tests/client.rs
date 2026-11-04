@@ -305,6 +305,97 @@ fn a_restarted_desktop_gets_the_screen_and_types_with_its_kept_lease() {
     second.close();
 }
 
+/// How many attachments the daemon has for `terminal`, and whether it still runs.
+fn attachments(client: &Client, terminal: &tessel_host_protocol::TerminalId) -> Option<u32> {
+    let listed: tessel_host_protocol::pty::Listed = client
+        .ask(
+            tessel_host_protocol::pty::kind::LIST,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+    listed
+        .terminals
+        .iter()
+        .find(|t| t.terminal == *terminal)
+        .map(|t| t.attached)
+}
+
+/// A pane closed while its program prints nothing: dropping the `Terminal` and its receiver
+/// lets go at once (the daemon drops the attachment, no follower waits for an event that may
+/// never come), the program keeps running, and a reconnection never reattaches it.
+#[test]
+fn dropping_a_silent_terminal_lets_go_without_ending_it_or_reattaching() {
+    let mut home = Home::new("clientdrop");
+    let (client, connector) = connect(&mut home);
+    let (terminal, events) = Terminal::create(
+        &client,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let (id, pid) = (terminal.id().clone(), terminal.pid);
+    assert_eq!(attachments(&client, &id), Some(1));
+    drop(terminal);
+    drop(events);
+    wait_for("the attachment to go", || {
+        attachments(&client, &id) == Some(0)
+    });
+    assert!(alive(pid), "the program goes on");
+
+    let epoch = client.epoch().unwrap();
+    cut(&connector);
+    wait_for("the reconnection", || {
+        client.link().is_ok()
+            && client.state()
+                == ConnectionState::Connected {
+                    epoch: epoch.clone(),
+                }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(attachments(&client, &id), Some(0), "never reattached");
+    assert!(alive(pid));
+    client.close();
+}
+
+/// Dropping only the receiver lets go too, at the next event: nothing can read the terminal's
+/// events any more, so it is detached and never reattached.
+#[test]
+fn dropping_only_the_receiver_lets_go_at_the_next_event() {
+    let mut home = Home::new("clientrecv");
+    let (client, connector) = connect(&mut home);
+    let (terminal, events) = Terminal::create(
+        &client,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let id = terminal.id().clone();
+    drop(events);
+    terminal.input(b"wake up\n").unwrap();
+    wait_for("the attachment to go", || {
+        attachments(&client, &id) == Some(0)
+    });
+
+    let epoch = client.epoch().unwrap();
+    cut(&connector);
+    wait_for("the reconnection", || {
+        client.link().is_ok()
+            && client.state()
+                == ConnectionState::Connected {
+                    epoch: epoch.clone(),
+                }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(attachments(&client, &id), Some(0), "never reattached");
+    // The lease is still this client's: typing works without any attachment.
+    terminal.input(b"still typing\n").unwrap();
+    client.close();
+}
+
 #[test]
 fn a_cut_link_reconnects_and_the_terminal_continues_exactly() {
     let mut home = Home::new("clientcut");

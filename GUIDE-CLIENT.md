@@ -121,6 +121,10 @@ let (terminal, events) = Terminal::create(&client, argv, cwd, env, size)?;
   program (it retries with the same input number until `request_timeout`): `Ok` means typed; an
   error after a reconnection that outlasted the timeout means it may or may not have been, so
   say so rather than typing it again. Resize, signal and close need the lease.
+- Closing a pane: dropping the `Terminal` (or only its receiver) lets go of it at once, even
+  while its program prints nothing. The daemon drops the attachment and the client never
+  reattaches it, but the program goes on with its lease, so keep the id, epoch and lease to
+  pick it up later with `attach_fresh`. To end the program, `terminal.close()` first.
 
 ## 5. File trees
 

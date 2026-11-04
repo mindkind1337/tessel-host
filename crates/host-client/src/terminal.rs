@@ -13,7 +13,7 @@
 use crate::link::{Link, StreamItem};
 use crate::{Client, ClientError, Resume};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -101,12 +101,23 @@ struct Shared {
     next_input: AtomicU64,
     events: SyncSender<TerminalEvent>,
     lost: Mutex<bool>,
+    /// The application let go (dropped the `Terminal` or its receiver): never followed or
+    /// reattached again.
+    abandoned: AtomicBool,
 }
 
-/// One terminal. Dropping it detaches nothing on the host: the program goes on.
+/// One terminal. Dropping it (or its event receiver) lets go of it: its attachment is detached
+/// on the host and it is never reattached, but the program goes on there, with its lease, so
+/// another `Terminal::attach_fresh` can pick it up later. Ending the program is `close`.
 pub struct Terminal {
     shared: Arc<Shared>,
     pub pid: u32,
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.shared.abandon();
+    }
 }
 
 fn random_key() -> DedupKey {
@@ -190,6 +201,7 @@ impl Terminal {
             next_input: AtomicU64::new(1),
             events,
             lost: Mutex::new(false),
+            abandoned: AtomicBool::new(false),
         });
         let link = client.link()?;
         let had_lease = shared.lease.lock().unwrap().is_some();
@@ -465,6 +477,33 @@ impl Shared {
         Some(self.delivery.lock().unwrap().last)
     }
 
+    /// The application let go of this terminal: its follower stops at once (its stream is
+    /// unregistered here, which ends the follower's wait even while the program prints
+    /// nothing), it is never reattached, and the daemon is asked to drop the attachment. The
+    /// program goes on, with its lease. Idempotent, and never waits for the daemon (the detach
+    /// is sent from a thread of its own).
+    fn abandon(&self) {
+        if self.abandoned.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let stream = {
+            let mut delivery = self.delivery.lock().unwrap();
+            delivery.generation += 1;
+            delivery.stream.take()
+        };
+        let (Some(stream), Ok(link)) = (stream, self.client.link()) else {
+            return;
+        };
+        link.unregister(&stream);
+        let timeout = self.client.options().request_timeout;
+        std::thread::spawn(move || {
+            let _ = link.request(
+                RawMessage::of(pty::kind::DETACH, &Detach { stream }),
+                timeout,
+            );
+        });
+    }
+
     /// Stops an attachment nobody follows any more (best effort: the link may be gone).
     fn detach(&self, link: &Arc<Link>, stream: StreamId) {
         link.unregister(&stream);
@@ -484,15 +523,23 @@ impl Shared {
         had_lease: bool,
         reattached: bool,
     ) {
-        let stale = |delivered| matches!(delivered, Delivered::Stale);
+        // A newer generation took over, or the application let go: this attachment goes.
+        let ended = |delivered: Delivered| match delivered {
+            Delivered::Sent | Delivered::Skipped => false,
+            Delivered::Stale => true,
+            Delivered::Closed => {
+                self.abandon();
+                true
+            }
+        };
         if had_lease
             && attached.lease.is_none()
-            && stale(self.deliver(generation, TerminalEvent::LeaseLost))
+            && ended(self.deliver(generation, TerminalEvent::LeaseLost))
         {
             return self.detach(link, attached.stream.clone());
         }
         if reattached
-            && stale(self.deliver(
+            && ended(self.deliver(
                 generation,
                 TerminalEvent::Reattached {
                     mode: attached.mode,
@@ -581,10 +628,12 @@ impl Shared {
                 if let Some(event) = translate(&message, &mut parts) {
                     match me.deliver(generation, event) {
                         Delivered::Sent | Delivered::Skipped => {}
-                        Delivered::Stale | Delivered::Closed => {
+                        Delivered::Stale => {
                             link.unregister(&stream);
                             return;
                         }
+                        // The application dropped its receiver: let go of the terminal.
+                        Delivered::Closed => return me.abandon(),
                     }
                 }
                 link.ack(&stream, seq);
@@ -607,7 +656,7 @@ impl Shared {
     /// of the links; the rest runs on a thread of its own, so an application slow to read
     /// this terminal's events never holds back the other sessions.
     pub(crate) fn resume_arc(self: &Arc<Self>, client: &Client, same_epoch: bool) {
-        if *self.lost.lock().unwrap() {
+        if *self.lost.lock().unwrap() || self.abandoned.load(Ordering::SeqCst) {
             return;
         }
         let generation = self.next_generation();
@@ -619,11 +668,10 @@ impl Shared {
     fn reattach(self: &Arc<Self>, link: Option<Arc<Link>>, generation: u64, same_epoch: bool) {
         // The replaced stream may have stopped before saying it: `Disconnected` always comes
         // before `Reattached` or `Lost`.
-        if matches!(
-            self.deliver(generation, TerminalEvent::Disconnected),
-            Delivered::Stale | Delivered::Closed
-        ) {
-            return;
+        match self.deliver(generation, TerminalEvent::Disconnected) {
+            Delivered::Sent | Delivered::Skipped => {}
+            Delivered::Stale => return,
+            Delivered::Closed => return self.abandon(),
         }
         if !same_epoch {
             *self.lost.lock().unwrap() = true;

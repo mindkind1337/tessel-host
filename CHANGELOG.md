@@ -25,6 +25,9 @@ Client (`tessel-host-client`):
   comes before `Reattached`, and nothing from a replaced stream comes after it, even when the
   application's receiver was full at the time of the break. A takeover replaces the attachment
   the same way. `last_seq()` is what was handed over, not what the UI applied.
+- Dropping a `Terminal`, or only its receiver, lets go of it: the attachment is detached on the
+  host at once (even while the program prints nothing) and never reattached, and the program
+  goes on with its lease.
 - Opening a link is bounded by `Options::connect_timeout` (20 s by default). `Client::close`
   abandons a reconnection in progress, and `Client::connect_cancellable` lets the UI cancel the
   first connection.
