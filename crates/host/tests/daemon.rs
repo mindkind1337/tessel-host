@@ -74,6 +74,17 @@ impl Drop for Home {
             // SAFETY: a signal to a daemon this test started.
             unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
         }
+        // The daemon still writes its log while it hangs up its terminals: let it finish first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        // SAFETY: signal 0 only checks that the process exists.
+        while self
+            .daemons
+            .iter()
+            .any(|pid| unsafe { libc::kill(*pid as i32, 0) } == 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
