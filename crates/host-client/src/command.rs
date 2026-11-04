@@ -21,12 +21,18 @@ pub struct CommandConnector {
     current: Arc<Mutex<Option<u32>>>,
 }
 
-struct Killer(Child);
+struct Killer(Option<Child>);
 
 impl Drop for Killer {
+    /// Kills at once; the process is reaped on a thread of its own, so dropping a connection
+    /// (closing a client or cancelling an opening from the UI thread) never waits for it.
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -82,7 +88,7 @@ impl Connector for CommandConnector {
         Ok(Pipe {
             reader: Box::new(reader),
             writer: Box::new(writer),
-            guard: Some(Box::new(Killer(child))),
+            guard: Some(Box::new(Killer(Some(child)))),
         })
     }
 }

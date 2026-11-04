@@ -131,13 +131,24 @@ impl Client {
     /// Connects once within `options.connect_timeout` (an error here is returned, not retried),
     /// then keeps the link up.
     pub fn connect(connector: Box<dyn Connector>, options: Options) -> Result<Self, ClientError> {
+        Self::connect_cancellable(connector, options, Arc::new(Opening::default()))
+    }
+
+    /// As `connect`, and `opening.cancel()` from another thread (a "Cancel" button) abandons
+    /// the first connection at once: its process is stopped and this answers `ConnectionLost`.
+    /// Once connected, cancelling `opening` changes nothing; `close` ends the client.
+    pub fn connect_cancellable(
+        connector: Box<dyn Connector>,
+        options: Options,
+        opening: Arc<Opening>,
+    ) -> Result<Self, ClientError> {
         let connector: Arc<dyn Connector> = Arc::from(connector);
         let link = Link::open(
             connector.clone(),
             &options.capabilities,
             options.budgets,
             options.connect_timeout,
-            Arc::new(Opening::default()),
+            opening,
         )?;
         let epoch = link.hello.host_epoch.clone();
         let inner = Arc::new(Inner {

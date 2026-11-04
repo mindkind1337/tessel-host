@@ -5,7 +5,7 @@ use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tessel_host_client::{Client, ClientError, ConnectionState, Connector, Options, Pipe};
+use tessel_host_client::{Client, ClientError, ConnectionState, Connector, Opening, Options, Pipe};
 use tessel_host_protocol::{
     Budgets, ClientFrame, Epoch, HelloOk, HostFrame, MAX_FRAME_BYTES, ReplyMessage, VERSION,
     read_frame, write_frame,
@@ -160,6 +160,28 @@ fn a_silent_daemon_times_out_and_its_connection_is_stopped() {
     );
     assert!(matches!(result, Err(ClientError::Timeout)));
     assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(fake.stopped(0));
+}
+
+#[test]
+fn cancelling_the_first_connection_stops_it_at_once() {
+    let fake = Fake::new(&[Daemon::Silent]);
+    let opening = Arc::new(Opening::default());
+    let cancel = opening.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        cancel.cancel();
+    });
+    let started = Instant::now();
+    // Long enough that only the cancel can end it.
+    let result = Client::connect_cancellable(
+        Box::new(Shared(fake.clone())),
+        options(Duration::from_secs(60)),
+        opening,
+    );
+    canceller.join().unwrap();
+    assert!(matches!(result, Err(ClientError::ConnectionLost)));
+    assert!(started.elapsed() < Duration::from_secs(2));
     assert!(fake.stopped(0));
 }
 

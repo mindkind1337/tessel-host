@@ -60,7 +60,9 @@ let client = Client::connect(Box::new(connector), Options::default())?;
 `connect_timeout` (20 s by default) bounds each connection attempt, from opening the channel to
 the daemon's hello: an SSH channel that stays up while the daemon never answers is abandoned and
 its process stopped (`Client::connect` answers `Timeout`; a reconnection tries again).
-`client.close()` also abandons a reconnection in progress; a closed client stays `Closed`.
+`client.close()` also abandons a reconnection in progress; a closed client stays `Closed`. To let
+the person cancel the first connection, use `Client::connect_cancellable(connector, options,
+opening)` and call `opening.cancel()` from the UI: the attempt's process is stopped at once.
 `client.hello()` says what the host granted; a capability not granted is not offered in the UI.
 Ask `host.info` once for `persistence.survives_logout`: show `no` and `unknown` as a warning next
 to terminals ("terminals end when you log out of this host" / "may end").
