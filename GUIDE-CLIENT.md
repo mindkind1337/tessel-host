@@ -50,6 +50,15 @@ pub fn check_version(output: &str, version: &str, arch: Arch) -> bool;
    Windows it starts ssh without a console window, so no window flashes at each connection or
    reconnection.
 
+   The command is the exec request's own command, never a line written to a shell's standard
+   input (such as an exec channel running `/bin/sh`, then `exec … connect --stdio` sent on its
+   stdin): the shell may read past that line before it runs it, and the protocol bytes that
+   follow (the client's hello) are lost in the shell's buffer. Dash, `/bin/sh` on Debian and
+   Ubuntu, does: `printf 'exec cat\n0123\n' | dash` prints nothing, where bash prints `0123`. The
+   daemon then closes the connection when no hello came within its time (about 10 s), and its
+   log shows `client_open` then `client_close` with nothing in between. The same holds for the
+   other commands of a plan, whose standard input is the program (`upload`) or nothing.
+
 The connection starts the daemon when there is none. Then:
 
 ```rust

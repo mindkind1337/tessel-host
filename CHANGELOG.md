@@ -50,6 +50,9 @@ Repository:
   each step and removing what it made. Host and user are arguments; Linux only.
 - Tests: two tests of one process no longer share a home directory when they use the same
   name. They did, and wiped each other's daemon and repository now and then (a flaky CI run).
+- GUIDE-CLIENT.md: `connect --stdio` is the exec request's own command, never a line written to
+  a shell's standard input. Dash (`/bin/sh` on Debian and Ubuntu) reads past that line and
+  swallows the client's hello; the daemon then closes the connection after its hello timeout.
 
 ## 0.1.1
 
