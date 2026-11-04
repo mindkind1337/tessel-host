@@ -46,7 +46,9 @@ pub fn check_version(output: &str, version: &str, arch: Arch) -> bool;
 6. A connection is one SSH exec channel running `plan.connect` (or `commands(..).1`):
    `"$HOME/.tessel-server/host/bin/tessel-host-<version>-<arch>" connect --stdio`, the path in
    double quotes so the host's shell expands `$HOME`. With the system ssh:
-   `CommandConnector::new("ssh", ["-T", host, &connect])`, the command as one argument.
+   `CommandConnector::new("ssh", ["-T", host, &connect])`, the command as one argument. On
+   Windows it starts ssh without a console window, so no window flashes at each connection or
+   reconnection.
 
 The connection starts the daemon when there is none. Then:
 

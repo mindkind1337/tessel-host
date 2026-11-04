@@ -4,9 +4,15 @@ use std::io;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-/// Runs a command whose standard input and output are the connection, typically
-/// `ssh -T host '~/.tessel-server/host/bin/tessel-host-<version>-<arch>' connect --stdio`.
-/// The process is killed when its connection is dropped.
+/// Runs a command whose standard input and output are the connection, typically the system
+/// ssh with `tessel_host::install`'s connect command as one argument:
+/// `CommandConnector::new("ssh", ["-T", host, &connect])`, where `connect` is
+/// `"$HOME/.tessel-server/host/bin/tessel-host-<version>-<arch>" connect --stdio` (double
+/// quotes, so the host's shell expands `$HOME`). Never build that command here.
+///
+/// The process is killed when its connection is dropped. On Windows it starts without a console
+/// window of its own (`CREATE_NO_WINDOW`), so a desktop application does not flash one at each
+/// connection or reconnection.
 #[derive(Clone)]
 pub struct CommandConnector {
     program: OsString,
@@ -50,13 +56,20 @@ impl CommandConnector {
 
 impl Connector for CommandConnector {
     fn connect(&self) -> io::Result<Pipe> {
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&self.args)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn()?;
         let writer = child
             .stdin
             .take()
