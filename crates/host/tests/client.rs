@@ -426,8 +426,21 @@ fn dropping_only_the_receiver_lets_go_at_the_next_event() {
     });
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(attachments(&client, &id), Some(0), "never reattached");
-    // The lease is still this client's: typing works without any attachment.
-    terminal.input(b"still typing\n").unwrap();
+    // Let go: this object no longer types, though the lease stays valid on the host (a new,
+    // explicit attachment could use it).
+    assert!(terminal.lease().is_none());
+    assert!(terminal.input(b"blind typing\n").is_err());
+    let listed: tessel_host_protocol::pty::Listed = client
+        .ask(
+            tessel_host_protocol::pty::kind::LIST,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+    let info = listed.terminals.iter().find(|t| t.terminal == id).unwrap();
+    assert!(
+        info.leased && info.exited.is_none(),
+        "still running, still leased"
+    );
     client.close();
 }
 

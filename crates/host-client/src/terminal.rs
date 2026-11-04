@@ -56,6 +56,84 @@ pub enum TerminalEvent {
     },
     /// The daemon restarted: this terminal is gone.
     Lost,
+    /// This terminal's stream sent something this client refuses to apply. It is let go, as
+    /// if dropped: nothing more comes, it is never reattached, and it no longer types (its
+    /// lease stays valid on the host and can be used by a new, explicit attachment). Other
+    /// terminals and the link are not affected. The last event.
+    StreamRejected(StreamRejection),
+}
+
+/// Why a terminal's stream was refused. Fixed reasons, never the stream's contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamRejection {
+    /// Snapshot parts out of order, disagreeing on the screen they describe, too many of them,
+    /// or interrupted by another event.
+    InvalidSnapshot,
+    /// A snapshot larger than `MAX_SNAPSHOT_BYTES`.
+    OversizedSnapshot,
+}
+
+/// The largest snapshot this client assembles (all parts together). Parts are refused before
+/// they are kept, so no more than this is ever held for one snapshot.
+pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most parts of one snapshot: the daemon sends full 64 KiB parts and a last one, so a
+/// snapshot within `MAX_SNAPSHOT_BYTES` has at most this many. Bounds a flood of empty parts.
+const MAX_SNAPSHOT_PARTS: usize = MAX_SNAPSHOT_BYTES / MAX_CHUNK_BYTES + 1;
+
+/// A snapshot being received, checked part by part before anything is kept.
+#[derive(Default)]
+struct Parts {
+    first: Option<Snapshot>,
+    count: usize,
+    data: Vec<u8>,
+}
+
+impl Parts {
+    fn active(&self) -> bool {
+        self.first.is_some()
+    }
+
+    /// Takes one part; the assembled snapshot once its last part came.
+    fn accept(&mut self, part: Snapshot) -> Result<Option<TerminalEvent>, StreamRejection> {
+        let consistent = match &self.first {
+            None => part.part == 0,
+            Some(first) => {
+                part.part as usize == self.count
+                    && part.at == first.at
+                    && part.size == first.size
+                    && part.alternate == first.alternate
+                    && part.resync == first.resync
+            }
+        };
+        if !consistent || self.count >= MAX_SNAPSHOT_PARTS {
+            return Err(StreamRejection::InvalidSnapshot);
+        }
+        if self.data.len() + part.data.as_bytes().len() > MAX_SNAPSHOT_BYTES {
+            return Err(StreamRejection::OversizedSnapshot);
+        }
+        self.data.extend_from_slice(part.data.as_bytes());
+        self.count += 1;
+        let last = part.last;
+        if self.first.is_none() {
+            self.first = Some(Snapshot {
+                data: Chunk::default(),
+                ..part
+            });
+        }
+        if !last {
+            return Ok(None);
+        }
+        let first = self.first.take().expect("a first part");
+        self.count = 0;
+        Ok(Some(TerminalEvent::Snapshot {
+            at: first.at,
+            size: first.size,
+            alternate: first.alternate,
+            resync: first.resync,
+            data: std::mem::take(&mut self.data),
+        }))
+    }
 }
 
 /// What has been handed to the application, and which stream may hand over more.
@@ -308,7 +386,13 @@ impl Terminal {
         &self.shared.terminal
     }
 
+    /// The lease this object types with. None once it was let go (dropped receiver, rejected
+    /// stream): such an object never types again, even though the lease stays valid on the
+    /// host for a new, explicit attachment.
     pub fn lease(&self) -> Option<LeaseKey> {
+        if self.shared.delivery.lock().unwrap().abandoned {
+            return None;
+        }
         self.shared.lease.lock().unwrap().clone()
     }
 
@@ -402,10 +486,22 @@ impl Terminal {
             .map(|_| ())
     }
 
+    /// Ends the program (hang-up, then a kill). Allowed even once this object was let go:
+    /// ending a program needs no screen, and a terminal whose screen this client refused to
+    /// apply could otherwise never be ended from here.
     pub fn close(&self) -> Result<(), ClientError> {
+        let lease = self
+            .shared
+            .lease
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(ClientError::Refused(tessel_host_protocol::WireError::new(
+                ErrorCode::PermissionDenied,
+            )))?;
         let request = Close {
             terminal: self.shared.terminal.clone(),
-            lease: self.lease_or_refuse()?,
+            lease,
         };
         self.shared
             .client
@@ -462,49 +558,46 @@ impl Terminal {
 
 /// What a stream's message means to the application, if anything (a snapshot part that is not
 /// the last one is kept until the last arrives).
-fn translate(message: &RawMessage, parts: &mut Vec<Snapshot>) -> Option<TerminalEvent> {
-    match message.kind.as_str() {
-        pty::kind::OUTPUT => {
-            let output: Output = message.body_as().ok()?;
-            Some(TerminalEvent::Output {
+/// What a stream's message means to the application, if anything. Snapshot parts are checked
+/// one by one before they are kept (`Parts`); another event in the middle of a snapshot is
+/// refused, so a snapshot is never applied half-received.
+fn translate(
+    message: &RawMessage,
+    parts: &mut Parts,
+) -> Result<Option<TerminalEvent>, StreamRejection> {
+    if parts.active() && message.kind != pty::kind::SNAPSHOT {
+        return Err(StreamRejection::InvalidSnapshot);
+    }
+    Ok(match message.kind.as_str() {
+        pty::kind::OUTPUT => message
+            .body_as::<Output>()
+            .ok()
+            .map(|output| TerminalEvent::Output {
                 seq: output.seq,
                 data: output.data.into_bytes(),
-            })
-        }
+            }),
         pty::kind::RESIZED => {
-            let resized: Resized = message.body_as().ok()?;
-            Some(TerminalEvent::Resized {
-                seq: resized.seq,
-                size: resized.size,
-            })
+            message
+                .body_as::<Resized>()
+                .ok()
+                .map(|resized| TerminalEvent::Resized {
+                    seq: resized.seq,
+                    size: resized.size,
+                })
         }
         pty::kind::SNAPSHOT => {
-            let part: Snapshot = message.body_as().ok()?;
-            let done = part.last;
-            parts.push(part);
-            if !done {
-                return None;
-            }
-            let all = std::mem::take(parts);
-            let first = &all[0];
-            Some(TerminalEvent::Snapshot {
-                at: first.at,
-                size: first.size,
-                alternate: first.alternate,
-                resync: first.resync,
-                data: all
-                    .iter()
-                    .flat_map(|p| p.data.as_bytes().to_vec())
-                    .collect(),
-            })
+            let part: Snapshot = message
+                .body_as()
+                .map_err(|_| StreamRejection::InvalidSnapshot)?;
+            return parts.accept(part);
         }
         pty::kind::EXIT => message.body_as::<Exit>().ok().map(TerminalEvent::Exit),
-        pty::kind::LEASE_LOST => {
-            let _: LeaseLost = message.body_as().ok()?;
-            Some(TerminalEvent::LeaseLost)
-        }
+        pty::kind::LEASE_LOST => message
+            .body_as::<LeaseLost>()
+            .ok()
+            .map(|_| TerminalEvent::LeaseLost),
         _ => None,
-    }
+    })
 }
 
 impl Shared {
@@ -688,7 +781,7 @@ impl Shared {
                     TerminalEvent::Disconnected => Effect::Disconnected,
                     TerminalEvent::Reattached { .. } => Effect::Reattached,
                     TerminalEvent::LeaseLost => Effect::LeaseLost,
-                    TerminalEvent::Lost => Effect::Nothing,
+                    TerminalEvent::Lost | TerminalEvent::StreamRejected(_) => Effect::Nothing,
                 };
                 match self.events.try_send(event) {
                     Ok(()) => {
@@ -723,9 +816,18 @@ impl Shared {
         let me = self.clone();
         let link = link.clone();
         std::thread::spawn(move || {
-            let mut parts: Vec<Snapshot> = Vec::new();
+            let mut parts = Parts::default();
             for StreamItem { seq, message } in receiver {
-                if let Some(event) = translate(&message, &mut parts) {
+                let event = match translate(&message, &mut parts) {
+                    Ok(event) => event,
+                    Err(reason) => {
+                        // Refused for this terminal only: told once, then let go. The link and
+                        // the other terminals go on; nothing reconnects for it.
+                        let _ = me.deliver(generation, TerminalEvent::StreamRejected(reason));
+                        return me.abandon();
+                    }
+                };
+                if let Some(event) = event {
                     match me.deliver(generation, event) {
                         Delivered::Sent | Delivered::Skipped => {}
                         Delivered::Stale => {

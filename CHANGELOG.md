@@ -13,6 +13,14 @@ Client (`tessel-host-client`), no daemon change:
   find the same terminal and lease (the daemon keeps the outcome 10 minutes, per run). Another
   epoch answers `EpochChanged` without sending; a terminal still being created (`busy`) is
   retried briefly.
+- Snapshots are checked part by part before anything is kept: parts must come in order and
+  agree on the screen, nothing else may come in the middle, and one snapshot holds at most
+  `MAX_SNAPSHOT_BYTES` (16 MiB). Otherwise `TerminalEvent::StreamRejected` (`InvalidSnapshot`
+  or `OversizedSnapshot`) ends this terminal's stream only: it is let go and never
+  reattached, the link and the other terminals go on, nothing reconnects for it.
+- A terminal object that was let go (dropped receiver, rejected stream) no longer types:
+  `lease()` is `None` and input, resize and signal are refused. `close()` still ends the
+  program, and the lease stays valid on the host for a new, explicit attachment.
 
 ## 0.1.1
 

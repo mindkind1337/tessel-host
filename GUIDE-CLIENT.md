@@ -128,6 +128,13 @@ let (terminal, events) = Terminal::create_keyed(&client, key, &epoch, argv, cwd,
     attachment sends (replay or snapshot) comes after it; nothing from the old one does, even
     when your receiver was full at the time of the break.
   - `Lost`: the daemon restarted: the pane's program is gone; offer to start a new one.
+  - `StreamRejected(reason)`: this terminal's stream sent a snapshot the client refuses. The
+    reasons are `InvalidSnapshot` (parts out of order, disagreeing, interrupted or too many) and
+    `OversizedSnapshot` (more than `MAX_SNAPSHOT_BYTES`, 16 MiB). It is the last event. The
+    object is let go: detached on the host, never reattached, and it no longer types; `close()`
+    still ends the program. The program and its lease stay on the host. Say so on the pane,
+    with no automatic retry. The link and the other terminals go on. Apply a snapshot to your
+    own screen in pieces per frame if you like; the client never holds more than 16 MiB of one.
 - `terminal.input(bytes)` types each input at most once, even across a reconnect or a busy
   program (it retries with the same input number until `request_timeout`): `Ok` means typed; an
   error after a reconnection that outlasted the timeout means it may or may not have been, so
