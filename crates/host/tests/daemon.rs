@@ -161,9 +161,9 @@ fn the_daemon_starts_once_and_outlives_a_killed_bridge() {
     let mut home = Home::new("outlive");
     let mut bridge = home.bridge();
     let first = bridge.hello();
-    assert!(first.capabilities.is_empty(), "no capability before gate 3");
     let info = bridge.info();
     home.daemons.push(info.pid);
+    assert_eq!(first.capabilities, vec![Capability::Pty]);
     assert_eq!(
         (info.version.as_str(), info.arch.as_str()),
         (tessel_host::VERSION, std::env::consts::ARCH)

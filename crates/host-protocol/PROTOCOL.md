@@ -3,7 +3,8 @@
 The wire contract between a Tessel client (the Rust desktop, later the Vue app) and
 `tessel-host` on a remote machine. `src/` implements it; `tests/fixtures/` holds one golden
 frame of each shape; `tests/wire.rs` checks the rules below and `tests/fuzz.rs` fuzzes them.
-The bodies of terminal, tree, git and editor messages come with their gates (3 to 6).
+Terminal messages are below; the bodies of tree, git and editor messages come with their gates
+(4 to 6).
 
 ## Frames
 
@@ -119,6 +120,53 @@ is a gap, never applied, and needs a snapshot or a reset. The host keeps at most
 flight); a slow client only slows its own stream. An acknowledgment for an event never sent
 closes the connection; an older one than already seen is ignored.
 
+## Terminals (capability `pty`)
+
+Requests and their replies (`src/pty.rs` has every field):
+
+| request | reply | what it does |
+| --- | --- | --- |
+| `terminal.create` | `terminal.created` | starts a program on a new terminal; the creator holds the lease |
+| `terminal.attach` | `terminal.attached` | starts a stream of the terminal's output for this connection |
+| `terminal.detach` | `done` | ends one attachment; the terminal goes on |
+| `terminal.input` | `terminal.input_ok` | bytes to type (needs the lease) |
+| `terminal.resize` | `done` | rows and columns (needs the lease) |
+| `terminal.signal` | `done` | `int`, `term`, `kill`, `hup`, `quit`, `tstp` or `cont` to its process group (needs the lease) |
+| `terminal.close` | `done` | hang-up to its process group, a kill after 3 seconds, then forgotten (needs the lease) |
+| `terminal.list` | `terminal.listed` | every terminal, the daemon's resident memory and the replay bytes kept, separately |
+
+- A terminal belongs to the daemon, not to a connection: a connection that goes, by a closed
+  channel or a killed SSH client, only takes its attachments with it. The program goes on, its
+  output is kept, and its exit is kept for the next attachment.
+- `create` carries a deduplication key: a retry returns the first terminal. `argv` empty starts
+  the user's login shell; `env` is added to a small base (HOME, USER, LOGNAME, SHELL, PATH, LANG,
+  LC_*, TZ, and TERM defaulting to `xterm-256color`). At most 64 terminals.
+- Output is numbered by the terminal (`seq`, from 1, one number per chunk of up to 64 KiB). An
+  attachment names the last `seq` the client applied (`after`). If what follows is still kept,
+  the reply says `replay` and those chunks come as `terminal.output` events; otherwise it says
+  `snapshot`: `terminal.snapshot` events at the barrier `seq` come first, then output after it.
+  Either way no chunk arrives twice and none is skipped silently.
+- A snapshot redraws the screen (contents, colours, cursor, input modes, title, and the switch to
+  the alternate screen when it is shown) without replaying what produced it, so no clipboard
+  write, bell or reply to the program happens again. Not in a snapshot: the main screen behind
+  an alternate screen, and scrollback.
+- Each terminal keeps at most the `terminal_ring_bytes` of the connection that created it; all
+  terminals together at most the daemon's `total_ring_bytes`, the largest history giving way
+  first. History, never the program, is what is dropped. An attachment whose next chunk was
+  dropped before it read it gets a snapshot with `resync: true` once it has acknowledged what it
+  was sent.
+- Events of an attachment count against its `stream_window_bytes` until acknowledged, so a slow
+  client holds back only its own stream.
+- `attach` names the host epoch the client knew; another one is refused with `epoch_mismatch`
+  (the daemon restarted, its terminals are gone). An unknown terminal is `not_found`.
+- The lease: one holder at a time, needed to type, resize, signal and close. `writer: "take"`
+  takes it from whoever held it; `{"resume": lease}` keeps it across a reconnect; `"none"`
+  only watches. `input_id` goes up for each lease: one already applied is not typed again and
+  the reply says `duplicate: true`, so a retry after a lost reply is safe. Input waiting for the
+  program to read it is limited to 1 MiB (`busy`).
+- Terminals need a frame budget of at least 96 KiB (a 64 KiB chunk in base64 with its envelope);
+  below that, `create` and `attach` are refused with `bad_request`.
+
 ## Errors
 
 | code | meaning | retryable |
@@ -160,3 +208,8 @@ A client reads a code it does not know as `unknown`.
 | cancel of an answered or unknown request | after hello | reply `not_found` |
 | a `request_id` not above the last one | any time | connection error `bad_frame`, closes |
 | a fraction or a number beyond ±(2^53 − 1) | any time | connection error `bad_frame`, closes |
+| `terminal.create` again with the same key | after hello | the same `terminal.created` |
+| `terminal.attach` with another epoch | after hello | reply `epoch_mismatch` |
+| `terminal.input` without the lease | after hello | reply `permission_denied` |
+| `terminal.input` with an `input_id` already applied | after hello | `duplicate: true`, not typed |
+| `terminal.create` or `attach` under a 96 KiB frame budget | after hello | reply `bad_request` |

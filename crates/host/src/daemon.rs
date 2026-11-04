@@ -1,16 +1,20 @@
 //! `tessel-host serve`: accepts this user's connections on the private socket and answers them
 //! with the protocol. Threads, not an async runtime: a few clients, each with its own reader.
 use crate::log::Log;
+use crate::outbound::Outbound;
+use crate::pty::{Peer, Terminals};
 use crate::runtime::{Runtime, bind, is_this_user, peer_uid, random_bytes, runtime, try_lock};
 use std::io::{self, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use tessel_host_protocol::pty;
 use tessel_host_protocol::{
-    Budgets, ClientFrame, Connection, Epoch, ErrorCode, HostFrame, HostInfo, HostLimits,
-    MAX_FRAME_BYTES, PersistenceMethod, Step, WireError, encode_frame, read_frame, wire_error,
+    Budgets, Capability, ClientFrame, Connection, Epoch, ErrorCode, HostFrame, HostInfo,
+    HostLimits, MAX_FRAME_BYTES, PersistenceMethod, RawMessage, ReplyMessage, Step, StreamId,
+    WireError, encode_frame, read_frame, wire_error,
 };
 
 const MAX_CLIENTS: usize = 16;
@@ -142,17 +146,28 @@ fn run(
     };
     let listener = bind(runtime, &lock)?;
     let log = Arc::new(Log::new(runtime.log.clone()));
-    let limits = HostLimits {
-        capabilities: Vec::new(),
-        budgets: Budgets::SLOW_HOST,
-        epoch: Epoch::from_bytes(random_bytes()?),
-        info: HostInfo {
-            version: crate::VERSION.to_owned(),
-            arch: crate::arch().to_owned(),
-            pid: std::process::id(),
-            persistence: crate::persistence::describe(method),
+    let epoch = Epoch::from_bytes(random_bytes()?);
+    let budgets = Budgets::SLOW_HOST;
+    let shared = Arc::new(Shared {
+        limits: HostLimits {
+            capabilities: vec![Capability::Pty],
+            budgets,
+            epoch: epoch.clone(),
+            info: HostInfo {
+                version: crate::VERSION.to_owned(),
+                arch: crate::arch().to_owned(),
+                pid: std::process::id(),
+                persistence: crate::persistence::describe(method),
+            },
         },
-    };
+        terminals: Terminals::new(epoch, budgets.total_ring_bytes as usize),
+        next_peer: AtomicU64::new(1),
+    });
+    handle_termination(
+        shared.terminals.clone(),
+        runtime.socket.clone(),
+        log.clone(),
+    );
     log.event("serve", &[("pid", u64::from(std::process::id()))]);
     report(ready, b'k');
     if daemonize {
@@ -166,18 +181,19 @@ fn run(
             continue;
         }
         if active.load(Ordering::SeqCst) >= MAX_CLIENTS {
-            let _ = send(
-                &mut stream,
+            if let Ok(bytes) = encode_frame(
                 &HostFrame::connection_error(WireError::new(ErrorCode::Busy)),
                 MAX_FRAME_BYTES,
-            );
+            ) {
+                let _ = stream.write_all(&bytes);
+            }
             continue;
         }
         active.fetch_add(1, Ordering::SeqCst);
-        let (limits, log, active) = (limits.clone(), log.clone(), active.clone());
+        let (shared, log, active) = (shared.clone(), log.clone(), active.clone());
         std::thread::spawn(move || {
             log.event("client_open", &[]);
-            client(stream, limits);
+            client(stream, &shared);
             log.event("client_close", &[]);
             active.fetch_sub(1, Ordering::SeqCst);
         });
@@ -186,57 +202,185 @@ fn run(
     Ok(())
 }
 
-fn send(stream: &mut UnixStream, frame: &HostFrame, limit: usize) -> io::Result<()> {
-    let bytes = encode_frame(frame, limit)?;
-    stream.write_all(&bytes)
+struct Shared {
+    limits: HostLimits,
+    terminals: Arc<Terminals>,
+    next_peer: AtomicU64,
 }
 
-fn client(stream: UnixStream, limits: HostLimits) {
-    let Ok(mut writer) = stream.try_clone() else {
+/// SIGTERM or SIGINT: hang up every terminal's process group (a kill for those that linger),
+/// remove the socket, exit. Blocked in every thread so only this one receives them; programs
+/// started on terminals get a clean signal mask from `Command`.
+fn handle_termination(terminals: Arc<Terminals>, socket: std::path::PathBuf, log: Arc<Log>) {
+    // SAFETY: a local signal set; masking before any other thread exists.
+    let set = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        set
+    };
+    std::thread::spawn(move || {
+        let mut signal = 0;
+        // SAFETY: waits on the set blocked above.
+        unsafe { libc::sigwait(&set, &mut signal) };
+        log.event("shutdown", &[("signal", signal as u64)]);
+        terminals.shutdown();
+        let _ = std::fs::remove_file(&socket);
+        std::process::exit(0);
+    });
+}
+
+fn encode(frame: &HostFrame, limit: usize) -> Option<Vec<u8>> {
+    encode_frame(frame, limit).ok()
+}
+
+fn done() -> RawMessage {
+    ReplyMessage::Done.into_raw()
+}
+
+/// A capability request, answered. The stream of a new attachment comes back too: its events
+/// start only once the reply is queued, so the client knows the stream before its first event.
+fn handle(
+    shared: &Shared,
+    peer: &Peer,
+    message: &RawMessage,
+) -> (Result<RawMessage, WireError>, Option<StreamId>) {
+    let terminals = &shared.terminals;
+    let reply = match message.kind.as_str() {
+        pty::kind::CREATE => message
+            .body_as::<pty::Create>()
+            .and_then(|request| terminals.create(request, peer))
+            .map(|created| RawMessage::of(pty::kind::CREATED, &created)),
+        pty::kind::ATTACH => {
+            return match message
+                .body_as::<pty::Attach>()
+                .and_then(|request| terminals.attach(request, peer))
+            {
+                Ok(attached) => {
+                    let stream = attached.stream.clone();
+                    (
+                        Ok(RawMessage::of(pty::kind::ATTACHED, &attached)),
+                        Some(stream),
+                    )
+                }
+                Err(error) => (Err(error), None),
+            };
+        }
+        pty::kind::DETACH => message
+            .body_as::<pty::Detach>()
+            .and_then(|request| terminals.detach(peer.id, &request))
+            .map(|()| done()),
+        pty::kind::INPUT => message
+            .body_as::<pty::Input>()
+            .and_then(|request| terminals.input(request))
+            .map(|ok| RawMessage::of(pty::kind::INPUT_OK, &ok)),
+        pty::kind::RESIZE => message
+            .body_as::<pty::Resize>()
+            .and_then(|request| terminals.resize(request))
+            .map(|()| done()),
+        pty::kind::SIGNAL => message
+            .body_as::<pty::SignalRequest>()
+            .and_then(|request| terminals.signal(request))
+            .map(|()| done()),
+        pty::kind::CLOSE => message
+            .body_as::<pty::Close>()
+            .and_then(|request| terminals.close(request))
+            .map(|()| done()),
+        pty::kind::LIST if message.body.is_null() => {
+            Ok(RawMessage::of(pty::kind::LISTED, &terminals.list()))
+        }
+        pty::kind::LIST => Err(WireError::detail(
+            ErrorCode::BadRequest,
+            "this message has no body",
+        )),
+        _ => Err(WireError::new(ErrorCode::UnsupportedKind)),
+    };
+    (reply, None)
+}
+
+fn client(stream: UnixStream, shared: &Shared) {
+    let Ok(socket) = stream.try_clone() else {
         return;
+    };
+    let out = Arc::new(Outbound::default());
+    let writer = {
+        let out = out.clone();
+        std::thread::spawn(move || out.drain(socket))
     };
     let mut reader = stream;
     let _ = reader.set_read_timeout(Some(HELLO_TIMEOUT));
-    let mut connection = Connection::new(limits);
+    let mut connection = Connection::new(shared.limits.clone());
     let mut limit = MAX_FRAME_BYTES;
+    let mut peer: Option<Peer> = None;
+    let id = shared.next_peer.fetch_add(1, Ordering::SeqCst);
     loop {
         let frame = match read_frame::<ClientFrame>(&mut reader, limit) {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(error) => {
-                if let Some(refusal) = wire_error(&error) {
-                    let _ = send(
-                        &mut writer,
-                        &HostFrame::connection_error(refusal.clone()),
-                        limit,
-                    );
+                if let Some(refusal) = wire_error(&error)
+                    && let Some(bytes) =
+                        encode(&HostFrame::connection_error(refusal.clone()), limit)
+                {
+                    out.control(bytes);
                 }
                 break;
             }
         };
-        let sent = match connection.on_frame(frame) {
-            Ok(Step::Reply(reply)) => send(&mut writer, &reply, limit),
-            // No capability is offered before gate 3: a dispatch cannot happen yet.
-            Ok(Step::Dispatch(dispatch)) => match connection.finish(
-                dispatch.request_id,
-                Err(WireError::new(ErrorCode::UnsupportedKind)),
-            ) {
-                Some(reply) => send(&mut writer, &reply, limit),
-                None => Ok(()),
-            },
-            Ok(Step::Ack(_)) => Ok(()),
+        match connection.on_frame(frame) {
+            Ok(Step::Reply(reply)) => {
+                if let Some(bytes) = encode(&reply, limit) {
+                    out.control(bytes);
+                }
+            }
+            Ok(Step::Dispatch(dispatch)) => {
+                let Some(peer) = &peer else { break };
+                let (result, stream) = handle(shared, peer, &dispatch.message);
+                if let Some(reply) = connection.finish(dispatch.request_id, result)
+                    && let Some(bytes) = encode(&reply, limit)
+                {
+                    out.control(bytes);
+                }
+                if let Some(stream) = stream {
+                    shared.terminals.start(&stream);
+                }
+            }
+            Ok(Step::Ack(ack)) => {
+                if let Err(refusal) = shared.terminals.ack(id, &ack) {
+                    if let Some(bytes) = encode(&HostFrame::connection_error(refusal), limit) {
+                        out.control(bytes);
+                    }
+                    break;
+                }
+            }
             Err(fatal) => {
-                let _ = send(&mut writer, &fatal.frame(), limit);
+                if let Some(bytes) = encode(&fatal.frame(), limit) {
+                    out.control(bytes);
+                }
                 break;
             }
-        };
-        if sent.is_err() {
+        }
+        if out.is_closed() {
             break;
         }
-        if let Some(agreed) = connection.negotiated() {
+        if peer.is_none()
+            && let Some(agreed) = connection.negotiated()
+        {
             limit = agreed.budgets.frame_bytes as usize;
             let _ = reader.set_read_timeout(None);
+            peer = Some(Peer {
+                id,
+                out: out.clone(),
+                frame_limit: limit,
+                terminal_ring_bytes: agreed.budgets.terminal_ring_bytes as usize,
+                window_bytes: agreed.budgets.stream_window_bytes,
+            });
         }
     }
-    let _ = writer.shutdown(Shutdown::Both);
+    shared.terminals.disconnect(id);
+    out.end();
+    let _ = writer.join();
+    let _ = reader.shutdown(Shutdown::Both);
 }

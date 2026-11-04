@@ -12,7 +12,11 @@ pub mod daemon;
 #[cfg(target_os = "linux")]
 mod log;
 #[cfg(target_os = "linux")]
+mod outbound;
+#[cfg(target_os = "linux")]
 pub mod persistence;
+#[cfg(target_os = "linux")]
+pub mod pty;
 #[cfg(target_os = "linux")]
 pub mod runtime;
 

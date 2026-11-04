@@ -65,3 +65,14 @@ token!(
     DedupKey,
     "deduplication key"
 );
+token!(
+    /// A terminal, random, valid within the epoch of the daemon that owns it.
+    TerminalId,
+    "terminal id"
+);
+token!(
+    /// The right to type into, resize, signal and close one terminal. One holder at a time;
+    /// attaching alone does not give it. Kept across reconnects so a client can resume it.
+    LeaseKey,
+    "lease"
+);

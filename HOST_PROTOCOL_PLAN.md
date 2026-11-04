@@ -1,6 +1,6 @@
 # Native remote host plan
 
-Status: gates 1 and 2 implemented (below); gates 3 to 7 to come. Target: Linux
+Status: gates 1 to 3 implemented (below); gates 4 to 7 to come. Target: Linux
 x86_64 and aarch64 musl executables in `~/.tessel-server`, installed without root.
 No changes to the running Electron checkout. This is part of full Tessel parity,
 not a replacement for the remaining desktop work.
@@ -61,6 +61,34 @@ host.info, killed bridge, same epoch. x86_64 is 803,624 bytes (static-pie),
 aarch64 710,432 bytes (static). Not verified: survival of a real SSH logout,
 a real host other than this WSL, aarch64 on real hardware, builds being
 reproducible, and Windows compilation of the host crates.
+Gate 3 (persistent terminals) is complete: `crates/host/src/pty` and the
+`pty` messages of `PROTOCOL.md`. Each terminal runs its program in its own
+session on a pseudo-terminal; one I/O thread per terminal polls output and
+queued input without blocking on either; a waiter records the exit with waitid
+WNOWAIT and reaps under the registry lock, so a process group is signalled only
+while its leader is ours. Output is a numbered ring per terminal (the creating
+connection's budget) under one daemon-wide byte cap, plus a vt100 screen model
+for snapshots. Attachments are per connection, with their own stream and
+acknowledgment window; a reply is queued before its attachment's first event.
+Leases, input deduplication, resize serialized with output, signals, close
+(hang-up then kill), list with RSS and retained bytes, epoch checks, a 96 KiB
+frame floor for terminals, and SIGTERM/SIGINT hanging up every terminal.
+Evidence (Ubuntu 24.04 WSL, Rust 1.99.1): 8 terminal tests over the real bridge
+and daemon: 4,000 numbered lines continuing while a SIGKILLed bridge is gone,
+reattached as replay with the same child pid and exactly the text, no duplicate
+or hole; a lost input reply retried as duplicate, leases (watching cannot type,
+taking ends the old lease), create deduplicated, close; a snapshot of the
+alternate screen with wide characters after a 1 KiB history evicted the start;
+resize seen by `stty size`; an exit while detached kept with its code; output
+evicted under a stalled window coming back as a resync snapshot; a killed daemon
+giving `epoch_mismatch` then `not_found`; a small frame budget refused. And a
+real SSH connection from Windows (OpenSSH client) to a throwaway user sshd in
+WSL, cut by killing the client mid-output: the bridge was gone on the host, the
+reconnect found the same daemon epoch and child pid, replayed from the barrier,
+and the 6,000 lines arrived exactly. Not verified: a real remote host and its
+logind policy, aarch64 terminals on real hardware, scrollback, the main screen
+behind an alternate screen (not in snapshots by design), and desktop rendering.
+
 Repository: since gate 2 this work lives in its own repository, `tessel-host`
 (moved from tessel-rust with its history), because the Rust and Vue versions both
 consume it and it has its own releases and CI. tessel-rust depends on a pinned
