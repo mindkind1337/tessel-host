@@ -13,7 +13,7 @@
 use crate::link::{Link, StreamItem};
 use crate::{Client, ClientError, Resume};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -70,6 +70,47 @@ struct Delivery {
     exited: bool,
     /// The current generation's stream, detached when a takeover replaces it.
     stream: Option<StreamId>,
+    /// The application let go (dropped the `Terminal` or its receiver). Kept here, under the
+    /// same lock as the generation, so letting go and starting a generation never interleave:
+    /// once set, no generation starts, none is current, nothing is handed over.
+    abandoned: bool,
+}
+
+impl Delivery {
+    fn new(last: u64) -> Self {
+        Self {
+            generation: 0,
+            last,
+            disconnected: false,
+            exited: false,
+            stream: None,
+            abandoned: false,
+        }
+    }
+
+    /// A new generation, unless the application let go.
+    fn begin(&mut self) -> Option<u64> {
+        if self.abandoned {
+            return None;
+        }
+        self.generation += 1;
+        Some(self.generation)
+    }
+
+    /// Whether `generation` may hand events over and keep its stream.
+    fn admits(&self, generation: u64) -> bool {
+        !self.abandoned && self.generation == generation
+    }
+
+    /// Lets go: no generation is current any more. The stream to stop, the first time only.
+    fn abandon(&mut self) -> Option<Option<StreamId>> {
+        if self.abandoned {
+            return None;
+        }
+        self.abandoned = true;
+        self.generation += 1;
+        Some(self.stream.take())
+    }
 }
 
 /// What handing an event over changes here.
@@ -101,9 +142,6 @@ struct Shared {
     next_input: AtomicU64,
     events: SyncSender<TerminalEvent>,
     lost: Mutex<bool>,
-    /// The application let go (dropped the `Terminal` or its receiver): never followed or
-    /// reattached again.
-    abandoned: AtomicBool,
 }
 
 /// One terminal. Dropping it (or its event receiver) lets go of it: its attachment is detached
@@ -191,17 +229,10 @@ impl Terminal {
             terminal,
             epoch: Mutex::new(epoch),
             lease: Mutex::new(lease),
-            delivery: Mutex::new(Delivery {
-                generation: 0,
-                last: after.unwrap_or(0),
-                disconnected: false,
-                exited: false,
-                stream: None,
-            }),
+            delivery: Mutex::new(Delivery::new(after.unwrap_or(0))),
             next_input: AtomicU64::new(1),
             events,
             lost: Mutex::new(false),
-            abandoned: AtomicBool::new(false),
         });
         let link = client.link()?;
         let had_lease = shared.lease.lock().unwrap().is_some();
@@ -226,9 +257,10 @@ impl Terminal {
     }
 
     /// The last numbered event handed to the application (an output's or resize's `seq`, a
-    /// snapshot's `at`). It is not what the application has applied yet: events can wait in
-    /// its receiver. To attach again from another run of the desktop, keep the number of the
-    /// last event the UI actually applied, and pass that as `after`.
+    /// snapshot's `at`). It says what was delivered, not what the application applied (events
+    /// can wait in its receiver), and nothing about a screen being rebuilt. A desktop that
+    /// starts again shows nothing: it attaches with `attach_fresh` (a snapshot first), never
+    /// with `attach` and a number kept from its previous run.
     pub fn last_seq(&self) -> u64 {
         self.shared.delivery.lock().unwrap().last
     }
@@ -336,8 +368,15 @@ impl Terminal {
         let link = shared.client.link()?;
         // The current stream stops handing events over now (its own lease_lost included); the
         // new attachment replays everything after the last event handed over.
-        let generation = shared.next_generation();
-        let replaced = shared.delivery.lock().unwrap().stream.clone();
+        let (generation, replaced) = {
+            let mut delivery = shared.delivery.lock().unwrap();
+            let Some(generation) = delivery.begin() else {
+                return Err(ClientError::Protocol(
+                    "this terminal was let go: its event receiver was dropped".into(),
+                ));
+            };
+            (generation, delivery.stream.clone())
+        };
         let result = shared.request_attach(&link, Writer::Take, shared.after());
         let attached = match result {
             Ok(attached) => {
@@ -347,11 +386,13 @@ impl Terminal {
             }
             Err(error) => {
                 // Back to following as before, on a new attachment of its own.
-                let generation = shared.next_generation();
-                let had_lease = shared.lease.lock().unwrap().is_some();
-                if let Ok(attached) = shared.request_attach(&link, shared.writer(), shared.after())
-                {
-                    shared.start(&link, &attached, generation, had_lease, false);
+                if let Some(generation) = shared.next_generation() {
+                    let had_lease = shared.lease.lock().unwrap().is_some();
+                    if let Ok(attached) =
+                        shared.request_attach(&link, shared.writer(), shared.after())
+                    {
+                        shared.start(&link, &attached, generation, had_lease, false);
+                    }
                 }
                 Err(error)
             }
@@ -420,14 +461,12 @@ impl Shared {
 
     /// Starts a new generation: from here, only a follower started with the number returned
     /// hands events over.
-    fn next_generation(&self) -> u64 {
-        let mut delivery = self.delivery.lock().unwrap();
-        delivery.generation += 1;
-        delivery.generation
+    fn next_generation(&self) -> Option<u64> {
+        self.delivery.lock().unwrap().begin()
     }
 
     fn current(&self, generation: u64) -> bool {
-        self.delivery.lock().unwrap().generation == generation
+        self.delivery.lock().unwrap().admits(generation)
     }
 
     /// Attaches after the last event handed over, or with a snapshot first when this client
@@ -483,13 +522,10 @@ impl Shared {
     /// program goes on, with its lease. Idempotent, and never waits for the daemon (the detach
     /// is sent from a thread of its own).
     fn abandon(&self) {
-        if self.abandoned.swap(true, Ordering::SeqCst) {
+        // Under the delivery lock: a generation starting at the same moment either comes
+        // first (and this stops it) or sees `abandoned` and never starts.
+        let Some(stream) = self.delivery.lock().unwrap().abandon() else {
             return;
-        }
-        let stream = {
-            let mut delivery = self.delivery.lock().unwrap();
-            delivery.generation += 1;
-            delivery.stream.take()
         };
         let (Some(stream), Ok(link)) = (stream, self.client.link()) else {
             return;
@@ -549,15 +585,18 @@ impl Shared {
         {
             return self.detach(link, attached.stream.clone());
         }
-        {
+        // Registered under the delivery lock: letting go after this unregisters the stream (so
+        // the follower's wait ends), and letting go before it means it is never registered.
+        let receiver = {
             let mut delivery = self.delivery.lock().unwrap();
-            if delivery.generation != generation {
+            if !delivery.admits(generation) {
                 drop(delivery);
                 return self.detach(link, attached.stream.clone());
             }
             delivery.stream = Some(attached.stream.clone());
-        }
-        self.follow(link, attached.stream.clone(), generation);
+            link.register(&attached.stream)
+        };
+        self.follow(link, attached.stream.clone(), receiver, generation);
     }
 
     /// Hands `event` to the application, in order and once. Only the current generation hands
@@ -570,7 +609,7 @@ impl Shared {
         loop {
             {
                 let mut delivery = self.delivery.lock().unwrap();
-                if delivery.generation != generation {
+                if !delivery.admits(generation) {
                     return Delivered::Stale;
                 }
                 let skip = match &event {
@@ -618,8 +657,13 @@ impl Shared {
 
     /// Hands a stream's events over in order, once each, acknowledging each once handed over
     /// (so a slow application holds the host back instead of piling events up here).
-    fn follow(self: &Arc<Self>, link: &Arc<Link>, stream: StreamId, generation: u64) {
-        let receiver = link.register(&stream);
+    fn follow(
+        self: &Arc<Self>,
+        link: &Arc<Link>,
+        stream: StreamId,
+        receiver: Receiver<StreamItem>,
+        generation: u64,
+    ) {
         let me = self.clone();
         let link = link.clone();
         std::thread::spawn(move || {
@@ -656,10 +700,13 @@ impl Shared {
     /// of the links; the rest runs on a thread of its own, so an application slow to read
     /// this terminal's events never holds back the other sessions.
     pub(crate) fn resume_arc(self: &Arc<Self>, client: &Client, same_epoch: bool) {
-        if *self.lost.lock().unwrap() || self.abandoned.load(Ordering::SeqCst) {
+        if *self.lost.lock().unwrap() {
             return;
         }
-        let generation = self.next_generation();
+        // Refused once the application let go, in the same critical section as letting go.
+        let Some(generation) = self.next_generation() else {
+            return;
+        };
         let link = client.link().ok();
         let me = self.clone();
         std::thread::spawn(move || me.reattach(link, generation, same_epoch));
@@ -696,5 +743,42 @@ impl Shared {
             }
             Err(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A resumption that saw the terminal still held, then starts its generation after the
+    /// application let go, is refused: both happen under the delivery lock, in one order or the
+    /// other, never interleaved.
+    #[test]
+    fn letting_go_and_starting_a_generation_never_interleave() {
+        let mut delivery = Delivery::new(0);
+        let first = delivery.begin().unwrap();
+        assert!(delivery.admits(first));
+        assert!(delivery.abandon().is_some());
+        assert!(!delivery.admits(first), "the current generation stops");
+        assert_eq!(delivery.begin(), None, "no generation starts after");
+        assert!(
+            !delivery.admits(delivery.generation),
+            "and none is current, whatever its number"
+        );
+        assert!(
+            delivery.abandon().is_none(),
+            "letting go twice does nothing"
+        );
+    }
+
+    #[test]
+    fn letting_go_hands_back_the_stream_to_stop_once() {
+        let mut delivery = Delivery::new(0);
+        delivery.begin().unwrap();
+        let stream = StreamId::from_bytes([1; 16]);
+        delivery.stream = Some(stream.clone());
+        assert_eq!(delivery.abandon(), Some(Some(stream)));
+        assert_eq!(delivery.stream, None);
+        assert_eq!(delivery.abandon(), None);
     }
 }

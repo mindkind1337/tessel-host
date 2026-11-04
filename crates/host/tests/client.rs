@@ -359,6 +359,41 @@ fn dropping_a_silent_terminal_lets_go_without_ending_it_or_reattaching() {
     client.close();
 }
 
+/// Dropping the `Terminal` while the application still holds its receiver: nothing more is
+/// handed over, not the old stream's `Disconnected` and not a reattachment after a reconnect.
+#[test]
+fn dropping_the_terminal_but_keeping_its_receiver_hands_nothing_more() {
+    let mut home = Home::new("clientkeep");
+    let (client, connector) = connect(&mut home);
+    let (terminal, events) = Terminal::create(
+        &client,
+        vec!["/bin/cat".into()],
+        None,
+        BTreeMap::new(),
+        Size { rows: 24, cols: 80 },
+    )
+    .unwrap();
+    let id = terminal.id().clone();
+    drop(terminal);
+    wait_for("the attachment to go", || {
+        attachments(&client, &id) == Some(0)
+    });
+    let epoch = client.epoch().unwrap();
+    cut(&connector);
+    wait_for("the reconnection", || {
+        client.link().is_ok()
+            && client.state()
+                == ConnectionState::Connected {
+                    epoch: epoch.clone(),
+                }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(attachments(&client, &id), Some(0), "never reattached");
+    let late: Vec<TerminalEvent> = events.try_iter().collect();
+    assert!(late.is_empty(), "nothing after letting go: {late:?}");
+    client.close();
+}
+
 /// Dropping only the receiver lets go too, at the next event: nothing can read the terminal's
 /// events any more, so it is detached and never reattached.
 #[test]
