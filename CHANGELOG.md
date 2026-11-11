@@ -8,6 +8,24 @@ release below: new fields are optional, and a client relying on one says which r
 
 Client (`tessel-host-client`), no daemon change:
 
+- Dropping a `Tree` or a `Git` lets go of it on the host. Before, nothing was sent: the
+  subscription and the expanded folders (their watches) stayed until the connection ended, and
+  after a reconnect the dropped session subscribed again and listed its folders again. Now its
+  follower stops at once, even on a silent stream or while the application's receiver is full
+  (it no longer blocks in `send`); `tree.unsubscribe` and a `tree.collapse` of the topmost
+  expanded folders (or `git.unsubscribe`) go out from a thread of their own, never waited for;
+  it is never subscribed again; nothing more is handed over. Dropping only the receiver lets go
+  at the next event, as for terminals. Folder ownership is tracked across trees of the same
+  client, so replacing a tree on the same root preserves the replacement's watches.
+- Reconnection delivers `Disconnected` before replacement Tree/Git events. Cleanup uses the
+  stream's own link; late followers cannot replace a newer root/repository. The supervisor
+  keeps reconnecting if a replacement link dies during session recovery, and close notification
+  registration is synchronized with link shutdown.
+- Late events of a stream let go of (`Link::unregister`) are dropped instead of kept as orphans,
+  where they held memory and orphan slots for the life of the link and could crowd out a new
+  stream's first events (the last 1,024 such streams are remembered; claiming one again makes it
+  live).
+
 - `Terminal::create_keyed` takes the deduplication key from the caller and the epoch it means,
   so a create whose reply was lost can be sent again within the same run of the desktop and
   find the same terminal and lease (the daemon keeps the outcome 10 minutes, per run). Another

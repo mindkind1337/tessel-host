@@ -7,6 +7,7 @@
 //! trees, editors and git open again by path. Every state is explicit ([`ConnectionState`]);
 //! nothing is presented as live when it is not.
 mod command;
+mod delivery;
 pub mod editor;
 pub mod git;
 mod link;
@@ -110,6 +111,7 @@ pub(crate) trait Resume: Send + Sync {
 }
 
 pub(crate) struct Inner {
+    folders: Mutex<tree::Folders>,
     connector: Arc<dyn Connector>,
     options: Options,
     link: Mutex<Option<Arc<Link>>>,
@@ -152,6 +154,7 @@ impl Client {
         )?;
         let epoch = link.hello.host_epoch.clone();
         let inner = Arc::new(Inner {
+            folders: Mutex::new(tree::Folders::default()),
             connector,
             options,
             link: Mutex::new(Some(link)),
@@ -195,6 +198,10 @@ impl Client {
 
     pub fn options(&self) -> &Options {
         &self.inner.options
+    }
+
+    pub(crate) fn folders(&self) -> std::sync::MutexGuard<'_, tree::Folders> {
+        self.inner.folders.lock().unwrap()
     }
 
     pub fn request(&self, message: RawMessage) -> Result<RawMessage, ClientError> {
@@ -327,7 +334,9 @@ impl Client {
 
     fn supervise(self) {
         loop {
-            let Ok(link) = self.link() else { return };
+            let Some(link) = self.inner.link.lock().unwrap().clone() else {
+                return;
+            };
             let _ = link.on_close().recv();
             if self.closed() {
                 return;

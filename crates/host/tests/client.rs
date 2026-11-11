@@ -5,15 +5,17 @@ mod common;
 
 use common::{EXE, Home, WAIT, alive};
 use std::collections::BTreeMap;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use tessel_host_client::editor::{Editor, SaveError};
 use tessel_host_client::git::{Git, GitEvent};
 use tessel_host_client::terminal::{Terminal, TerminalEvent};
 use tessel_host_client::tree::{Tree, TreeEvent};
 use tessel_host_client::{Client, CommandConnector, ConnectionState, Options};
+use tessel_host_protocol::git::GitStats;
 use tessel_host_protocol::pty::{AttachMode, Size};
-use tessel_host_protocol::{HostInfo, RawMessage, RelPath, ReplyMessage};
+use tessel_host_protocol::tree::TreeStats;
+use tessel_host_protocol::{HostInfo, RawMessage, RelPath, ReplyMessage, RepoId, RootId};
 
 fn connector(home: &Home) -> CommandConnector {
     CommandConnector::new(EXE, ["connect", "--stdio"]).env("HOME", &home.path)
@@ -714,5 +716,378 @@ fn a_save_cut_by_the_link_is_sent_again_and_a_conflict_is_never_silent() {
         std::fs::read(project.join("doc.txt")).unwrap(),
         b"someone else\n"
     );
+    client.close();
+}
+
+fn rel(parts: &[&str]) -> RelPath {
+    RelPath::from_components(parts.iter().map(|p| p.as_bytes().to_vec()).collect()).unwrap()
+}
+
+/// Asked directly: a dropped `Tree` or `Git` cannot be asked any more.
+fn tree_stats(client: &Client, root: &RootId) -> TreeStats {
+    client
+        .ask(
+            tessel_host_protocol::tree::kind::STATS,
+            &tessel_host_protocol::tree::Stats { root: root.clone() },
+        )
+        .unwrap()
+}
+
+fn git_stats(client: &Client, repo: &RepoId) -> GitStats {
+    client
+        .ask(
+            tessel_host_protocol::git::kind::STATS,
+            &tessel_host_protocol::git::Stats { repo: repo.clone() },
+        )
+        .unwrap()
+}
+
+/// Cuts the link and waits until another bridge carries it, on the same daemon, with time for
+/// the sessions to resume.
+fn reconnect(client: &Client, connector: &CommandConnector) {
+    let epoch = client.epoch().unwrap();
+    let before = connector.current_pid();
+    cut(connector);
+    wait_for("the reconnection", || {
+        connector.current_pid().is_some()
+            && connector.current_pid() != before
+            && client.link().is_ok()
+            && client.state()
+                == ConnectionState::Connected {
+                    epoch: epoch.clone(),
+                }
+    });
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+/// Takes what was handed over until the receiver ends (every sender gone: the follower stopped).
+fn drain_until_closed<T: std::fmt::Debug>(events: &Receiver<T>) -> Vec<T> {
+    let mut handed = Vec::new();
+    loop {
+        match events.recv_timeout(WAIT) {
+            Ok(event) => handed.push(event),
+            Err(RecvTimeoutError::Disconnected) => return handed,
+            Err(RecvTimeoutError::Timeout) => panic!("the follower never stopped: {handed:?}"),
+        }
+    }
+}
+
+/// A Files panel closed while nothing changes: dropping the `Tree` (its receiver kept) ends
+/// its subscription and folds what it expanded on the host at once (every watch given back),
+/// nothing more is handed over, and a reconnection never subscribes or lists it again.
+#[test]
+fn dropping_a_silent_tree_gives_its_watches_back_and_it_never_comes_back() {
+    let mut home = Home::new("treedrop");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join("src/deep")).unwrap();
+    std::fs::write(project.join("a.txt"), b"a").unwrap();
+    let (client, connector) = connect(&mut home);
+    let (tree, events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    let root = tree.root();
+    tree.expand(&RelPath::root()).unwrap();
+    tree.expand(&rel(&["src"])).unwrap();
+    tree.expand(&rel(&["src", "deep"])).unwrap();
+    let held = tree_stats(&client, &root);
+    assert_eq!((held.watches, held.cached_dirs), (3, 3), "{held:?}");
+
+    drop(tree);
+    wait_for("the watches to be given back", || {
+        let now = tree_stats(&client, &root);
+        (now.watches, now.cached_dirs) == (0, 0)
+    });
+    assert!(
+        drain_until_closed(&events).is_empty(),
+        "nothing after letting go"
+    );
+
+    std::fs::write(project.join("b.txt"), b"b").unwrap();
+    reconnect(&client, &connector);
+    let after = tree_stats(&client, &root);
+    assert_eq!(
+        (after.watches, after.cached_dirs),
+        (0, 0),
+        "never expanded again: {after:?}"
+    );
+    client.close();
+}
+
+#[test]
+fn replacement_tree_keeps_shared_folders_and_reconnects_in_order() {
+    let mut home = Home::new("treereplace");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join("src/deep")).unwrap();
+    let (client, connector) = connect(&mut home);
+    let (old, _old_events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    old.expand(&RelPath::root()).unwrap();
+    old.expand(&rel(&["src"])).unwrap();
+    let (new, events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    let root = new.root();
+    new.expand(&RelPath::root()).unwrap();
+    new.expand(&rel(&["src", "deep"])).unwrap();
+    drop(old);
+    // A request after the asynchronous cleanup, and a real file notification, prove
+    // that the old owner's folds did not remove the replacement's watches.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(tree_stats(&client, &root).cached_dirs, 3);
+    std::fs::write(project.join("src/deep/live.txt"), b"x").unwrap();
+    assert!(matches!(
+        events.recv_timeout(WAIT).unwrap(),
+        TreeEvent::Changed(_)
+    ));
+    while events.try_recv().is_ok() {}
+    reconnect(&client, &connector);
+    assert!(matches!(
+        events.recv_timeout(WAIT).unwrap(),
+        TreeEvent::Disconnected
+    ));
+    let mut relisted = 0;
+    while relisted < 2 {
+        match events.recv_timeout(WAIT).unwrap() {
+            TreeEvent::Relisted(_) => relisted += 1,
+            TreeEvent::Disconnected => panic!("duplicate disconnection"),
+            _ => {}
+        }
+    }
+    drop(new);
+    wait_for("replacement folders released", || {
+        tree_stats(&client, &root).cached_dirs == 0
+    });
+    for n in 0..3 {
+        let (old, _) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+        old.expand(&RelPath::root()).unwrap();
+        drop(old);
+        let (replacement, changed) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+        replacement.expand(&RelPath::root()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(project.join(format!("replacement-{n}.txt")), b"x").unwrap();
+        assert!(matches!(
+            changed.recv_timeout(WAIT).unwrap(),
+            TreeEvent::Changed(_)
+        ));
+        drop(replacement);
+        wait_for("replacement released in reverse order", || {
+            tree_stats(&client, &root).cached_dirs == 0
+        });
+    }
+    client.close();
+}
+
+#[test]
+fn failed_refresh_preserves_an_open_folders_reconnect_intent() {
+    let mut home = Home::new("treerefreshfail");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join("held")).unwrap();
+    let (client, connector) = connect(&mut home);
+    let (tree, events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    tree.expand(&rel(&["held"])).unwrap();
+    std::fs::rename(project.join("held"), project.join("moved")).unwrap();
+    assert!(tree.expand(&rel(&["held"])).is_err());
+    std::fs::rename(project.join("moved"), project.join("held")).unwrap();
+    reconnect(&client, &connector);
+    let deadline = Instant::now() + WAIT;
+    let mut disconnected = false;
+    loop {
+        match events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+        {
+            TreeEvent::Disconnected => disconnected = true,
+            TreeEvent::Relisted(listing) if listing.path == rel(&["held"]) => {
+                assert!(disconnected);
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(tree);
+    client.close();
+}
+
+/// The application stopped reading: the tree's receiver is full, its follower waits to hand the
+/// next change over and the link holds more. Dropping the `Tree` stops the follower at once,
+/// the same link carries on (a request is answered), the host lets go, and what was handed over
+/// before is all there is.
+#[test]
+fn dropping_a_tree_whose_receiver_is_full_lets_go_and_the_link_carries_on() {
+    let mut home = Home::new("treefull");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join("many")).unwrap();
+    let (client, connector) = connect(&mut home);
+    let bridge = connector.current_pid();
+    let (tree, events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    let root = tree.root();
+    tree.expand(&rel(&["many"])).unwrap();
+    let (observer_client, _) = connect(&mut home);
+    let (observer, observed) = Tree::open(&observer_client, &project.to_string_lossy()).unwrap();
+    observer.expand(&rel(&["many"])).unwrap();
+    let gate = std::thread::spawn(move || {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match observed.recv_timeout(remaining).unwrap() {
+                TreeEvent::Changed(change)
+                    if change.path == rel(&["many"]) && change.revision >= 600 =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+    // Far more separate changes than the receiver (256) and the link (256) hold.
+    for n in 0..3000 {
+        std::fs::write(project.join("many").join(format!("f{n}")), b"x").unwrap();
+        if n % 2 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    gate.join().unwrap();
+    drop(observer);
+    observer_client.close();
+    drop(tree);
+    wait_for("the watches to be given back", || {
+        tree_stats(&client, &root).watches == 0
+    });
+    let handed = drain_until_closed(&events);
+    assert!(
+        handed.iter().all(|e| matches!(e, TreeEvent::Changed(_))),
+        "{handed:?}"
+    );
+    assert_eq!(
+        handed.len(),
+        256,
+        "receiver full before drop, nothing after"
+    );
+    assert_eq!(connector.current_pid(), bridge, "the same link");
+    assert!(daemon(&client).pid > 0);
+    client.close();
+}
+
+/// Dropping only the Git receiver releases active watches at the next change and prevents
+/// subscriptions and background git commands after reconnection.
+#[test]
+fn dropping_only_git_receiver_releases_subscription_across_reconnect() {
+    let mut home = Home::new("gitrecvdrop");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&project)
+            .env("HOME", &home.path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (client, connector) = connect(&mut home);
+    let (git, events) = Git::open(&client, &project.to_string_lossy(), &RelPath::root()).unwrap();
+    assert!(matches!(
+        events.recv_timeout(WAIT).unwrap(),
+        GitEvent::Changed(_)
+    ));
+    wait_for("git watches active", || git.stats().unwrap().watches > 0);
+    drop(events);
+    std::fs::write(project.join("new.txt"), b"x").unwrap();
+    wait_for("git receiver released", || {
+        git.stats().unwrap().watches == 0
+    });
+    let commands = git.stats().unwrap().commands;
+    reconnect(&client, &connector);
+    std::fs::write(project.join("later.txt"), b"x").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(git.stats().unwrap().watches, 0);
+    assert_eq!(git.stats().unwrap().commands, commands);
+    drop(git);
+    client.close();
+}
+
+/// Dropping only the tree's receiver lets go at the next change; the tree still answers, what
+/// it expands after that is folded when it goes, and a reconnection never subscribes it again.
+#[test]
+fn dropping_only_a_trees_receiver_lets_go_at_the_next_change() {
+    let mut home = Home::new("treerecv");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (client, connector) = connect(&mut home);
+    let (tree, events) = Tree::open(&client, &project.to_string_lossy()).unwrap();
+    let root = tree.root();
+    tree.expand(&RelPath::root()).unwrap();
+    drop(events);
+    std::fs::write(project.join("wake.txt"), b"x").unwrap();
+    wait_for("the watches to be given back", || {
+        tree_stats(&client, &root).cached_dirs == 0
+    });
+
+    tree.expand(&RelPath::root()).unwrap();
+    reconnect(&client, &connector);
+    assert_eq!(
+        tree_stats(&client, &root).cached_dirs,
+        0,
+        "the reconnection expanded nothing again"
+    );
+    tree.expand(&RelPath::root()).unwrap();
+    assert_eq!(tree_stats(&client, &root).cached_dirs, 1);
+    drop(tree);
+    wait_for("the last expansion to be folded", || {
+        tree_stats(&client, &root).cached_dirs == 0
+    });
+    client.close();
+}
+
+/// A Changes panel closed: dropping the `Git` (its receiver kept) ends its subscription on the
+/// host, which stops the repository's watches and git commands, nothing more is handed over,
+/// and a reconnection never subscribes it again.
+#[test]
+fn dropping_a_git_stops_the_hosts_watches_and_commands_for_good() {
+    let mut home = Home::new("gitdrop");
+    let project = home.path.join("project");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("a.txt"), b"a").unwrap();
+    let git_ok = std::process::Command::new("bash")
+        .args(["-ec", "git init -q -b main; git add -A; git -c user.name=T -c user.email=t@example.invalid commit -qm one"])
+        .current_dir(&project)
+        .env("HOME", &home.path)
+        .status()
+        .unwrap()
+        .success();
+    assert!(git_ok);
+    let (client, connector) = connect(&mut home);
+    let (git, events) = Git::open(&client, &project.to_string_lossy(), &RelPath::root()).unwrap();
+    let repo = git.opened.repo.clone();
+    let first = events.recv_timeout(WAIT).unwrap();
+    assert!(
+        matches!(first, GitEvent::Changed(ref c) if c.reset),
+        "{first:?}"
+    );
+    wait_for("the repository's watches", || {
+        git_stats(&client, &repo).watches > 0
+    });
+
+    drop(git);
+    wait_for("the watches to stop", || {
+        git_stats(&client, &repo).watches == 0
+    });
+    let handed = drain_until_closed(&events);
+    assert!(
+        handed.iter().all(|e| matches!(e, GitEvent::Changed(_))),
+        "{handed:?}"
+    );
+    let commands = git_stats(&client, &repo).commands;
+    std::fs::write(project.join("b.txt"), b"b").unwrap();
+    // Beyond the quiet time and the longest wait before a status (300 ms, 2 s).
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        git_stats(&client, &repo).commands,
+        commands,
+        "no git command for nobody"
+    );
+
+    reconnect(&client, &connector);
+    std::fs::write(project.join("c.txt"), b"c").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let after = git_stats(&client, &repo);
+    assert_eq!(after.watches, 0, "never subscribed again: {after:?}");
+    assert_eq!(after.commands, commands);
     client.close();
 }

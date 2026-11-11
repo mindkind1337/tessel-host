@@ -179,6 +179,18 @@ let listing = tree.expand(&RelPath::root())?;
 - `Relisted(listing)`: after a reconnect (or a daemon restart), replace what is shown for that
   folder.
 - Collapse folders you no longer show (`tree.collapse`): the host stops watching them.
+- Closing the panel: dropping the `Tree` lets go of it at once, even while nothing changes and
+  even while your receiver is full. The host ends its subscription and folds expanded folders
+  that no other tree of this Client holds (only on this connection). Nothing more is handed
+  over, and a reconnection never
+  subscribes it again. Dropping only the receiver lets go at the next change; what the tree
+  expands after that is folded when it is dropped.
+- Folders are kept per connection, with ownership tracked across trees of the same `Client`:
+  a folder is folded only when no other tree holds it or a descendant. Replacing a tree on the
+  same root is safe in either order. Other connections keep their own expanded folders.
+  Drain receivers: a full receiver holds back the link until read or dropped.
+- After reconnection, `Disconnected` precedes the replacement subscription's events and
+  `Relisted` entries, including when the old follower was blocked on a full receiver.
 
 ## 6. The editor
 
@@ -229,8 +241,12 @@ let (git, events) = Git::open(&client, "/home/user/project", &RelPath::root())?;
   (a refresh is pending or the last one failed: keep showing the list, marked "updating" or
   "out of date"), `truncated` ("more than 50,000 changes: list cut"), `slow`, and the branch.
 - `git.refresh()` asks for a full read (a "Refresh" button); otherwise nothing needs asking.
-- After a reconnect or a daemon restart the session subscribes again and the next event resets
-  the list.
+- After a reconnect or a daemon restart, `Disconnected` precedes the replacement subscription's
+  events; its first status resets the list.
+- Closing the panel: dropping the `Git` lets go of it at once, even while nothing changes and
+  even while your receiver is full. The host ends its subscription (the last one stops the
+  repository's watches and git commands), nothing more is handed over, and a reconnection never
+  subscribes it again. Dropping only the receiver lets go at the next event.
 
 ## 8. Falling back
 

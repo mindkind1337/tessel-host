@@ -17,7 +17,9 @@ versions of Tessel and has its own releases.
 - `crates/host-client`: the client library for the desktop (builds on Windows): one link over any
   byte stream (`CommandConnector` runs e.g. `ssh host <installed> connect --stdio`), reconnection
   with resumed sessions on the same daemon and an explicit state on a restarted one, and typed
-  sessions for terminals, file trees, the editor and git.
+  sessions for terminals, file trees, the editor and git. Dropping a tree or git session releases
+  its subscription even with a full receiver; replacement trees retain shared folder watches.
+  Reconnection reports disconnection before delivering replacement tree/git events.
 - `crates/host-xtask`: builds and checks releases.
 - [GUIDE-CLIENT.md](GUIDE-CLIENT.md): the exact sequences a desktop implements, installation,
   degraded states and the editor's dirty buffer across a reconnect included.

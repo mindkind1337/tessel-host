@@ -2,7 +2,7 @@
 //! `tessel-host connect --stdio`, a local process, a test pipe). It says hello, matches replies
 //! to requests, routes stream events to whoever registered the stream, and reports its end.
 use crate::ClientError;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
@@ -16,6 +16,8 @@ use tessel_host_protocol::{
 /// Events of a stream nobody claimed yet (its reply is still on its way to the requester).
 const MAX_ORPHAN_EVENTS: usize = 4096;
 const MAX_ORPHAN_STREAMS: usize = 64;
+/// Streams let go of that are remembered, so their late events are dropped (the last ones).
+const MAX_GONE_STREAMS: usize = 1024;
 /// Events delivered to a stream's owner but not consumed yet: beyond, the link waits, the
 /// acknowledgments stop, and the host holds the stream back.
 pub(crate) const STREAM_BUFFER: usize = 256;
@@ -88,11 +90,40 @@ fn handshake(
     }
 }
 
+/// Streams let go of (`unregister`): what the host still sends on them (events already on their
+/// way when it was told to stop) is dropped, never kept as orphans, where it would hold memory
+/// and orphan slots for the life of the link and could crowd out a new stream's first events.
+#[derive(Default)]
+struct Gone {
+    order: VecDeque<StreamId>,
+    set: HashSet<StreamId>,
+}
+
+impl Gone {
+    fn insert(&mut self, stream: &StreamId) {
+        if self.set.insert(stream.clone()) {
+            self.order.push_back(stream.clone());
+            if self.order.len() > MAX_GONE_STREAMS
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.set.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, stream: &StreamId) {
+        if self.set.remove(stream) {
+            self.order.retain(|s| s != stream);
+        }
+    }
+}
+
 pub struct Link {
     writer: Mutex<Box<dyn Write + Send>>,
     pending: Mutex<Pending>,
     routes: Mutex<HashMap<StreamId, SyncSender<StreamItem>>>,
     orphans: Mutex<HashMap<StreamId, VecDeque<StreamItem>>>,
+    gone: Mutex<Gone>,
     next_id: AtomicU64,
     alive: AtomicBool,
     pub hello: HelloOk,
@@ -186,6 +217,7 @@ impl Link {
             pending: Mutex::new(HashMap::new()),
             routes: Mutex::new(HashMap::new()),
             orphans: Mutex::new(HashMap::new()),
+            gone: Mutex::new(Gone::default()),
             next_id: AtomicU64::new(2),
             alive: AtomicBool::new(true),
             hello: agreed,
@@ -210,8 +242,9 @@ impl Link {
     /// A receiver that gets a message (or is dropped) when the link ends.
     pub fn on_close(&self) -> Receiver<()> {
         let (sender, receiver) = channel();
+        let mut closed = self.closed.lock().unwrap();
         if self.alive() {
-            self.closed.lock().unwrap().push(sender);
+            closed.push(sender);
         }
         receiver
     }
@@ -246,7 +279,12 @@ impl Link {
         for (_, waiter) in self.pending.lock().unwrap().drain() {
             let _ = waiter.send(Err(ClientError::ConnectionLost));
         }
-        self.routes.lock().unwrap().clear();
+        {
+            // Under the orphans lock, as `register` claims: a stream claimed from now on gets a
+            // receiver that has already ended, never a route nobody will feed.
+            let _orphans = self.orphans.lock().unwrap();
+            self.routes.lock().unwrap().clear();
+        }
         for closed in self.closed.lock().unwrap().drain(..) {
             let _ = closed.send(());
         }
@@ -263,6 +301,10 @@ impl Link {
                 let _ = sender.send(item);
             }
             None => {
+                // Let go of: what is still on its way is dropped.
+                if self.gone.lock().unwrap().set.contains(&stream) {
+                    return;
+                }
                 if orphans.len() >= MAX_ORPHAN_STREAMS && !orphans.contains_key(&stream) {
                     return;
                 }
@@ -274,9 +316,16 @@ impl Link {
         }
     }
 
-    /// Claims a stream: events that came before the claim are delivered first, in order.
+    /// Claims a stream: events that came before the claim are delivered first, in order. On a
+    /// link that ended, the receiver ends at once (its follower sees the end, not a silence).
     pub fn register(&self, stream: &StreamId) -> Receiver<StreamItem> {
         let mut orphans = self.orphans.lock().unwrap();
+        if !self.alive() {
+            let (_, ended) = sync_channel(0);
+            return ended;
+        }
+        // Claimed again (a daemon may answer with an id seen before): live from now on.
+        self.gone.lock().unwrap().remove(stream);
         let early = orphans.remove(stream).unwrap_or_default();
         let (sender, receiver) = sync_channel(STREAM_BUFFER + early.len());
         for item in early {
@@ -287,9 +336,14 @@ impl Link {
         receiver
     }
 
+    /// Lets go of a stream: its owner's receiver ends once it took what it holds, and whatever
+    /// the host still sends on it is dropped. Under the orphans lock, as in `route`, so an event
+    /// arriving meanwhile goes either to the route (ending next) or nowhere, never to orphans.
     pub fn unregister(&self, stream: &StreamId) {
+        let mut orphans = self.orphans.lock().unwrap();
         self.routes.lock().unwrap().remove(stream);
-        self.orphans.lock().unwrap().remove(stream);
+        orphans.remove(stream);
+        self.gone.lock().unwrap().insert(stream);
     }
 
     pub fn ack(&self, stream: &StreamId, seq: u64) {
@@ -307,35 +361,63 @@ impl Link {
         message: RawMessage,
         timeout: Duration,
     ) -> Result<RawMessage, ClientError> {
+        self.send(message)?.wait(timeout)
+    }
+
+    /// Writes a request now and hands back its reply to wait for later (or never: dropping it
+    /// ignores the reply). The host answers a connection's requests in the order written, so a
+    /// caller that decides and writes under one lock keeps its decisions in order.
+    pub(crate) fn send(&self, message: RawMessage) -> Result<Reply<'_>, ClientError> {
         if !self.alive() {
             return Err(ClientError::ConnectionLost);
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = channel();
         self.pending.lock().unwrap().insert(id, sender);
-        {
-            let mut writer = self.writer.lock().unwrap();
-            let sent = write_frame(
-                &mut *writer,
-                &ClientFrame::request_raw(id, message),
-                self.frame_limit,
-            )
-            .and_then(|()| writer.flush());
-            if sent.is_err() {
-                // The other end is gone: no request goes through this link any more, even
-                // before its reader sees the end.
-                self.alive.store(false, Ordering::SeqCst);
-                self.pending.lock().unwrap().remove(&id);
-                return Err(ClientError::ConnectionLost);
-            }
+        let mut writer = self.writer.lock().unwrap();
+        let sent = write_frame(
+            &mut *writer,
+            &ClientFrame::request_raw(id, message),
+            self.frame_limit,
+        )
+        .and_then(|()| writer.flush());
+        if sent.is_err() {
+            // The other end is gone: no request goes through this link any more, even
+            // before its reader sees the end.
+            self.alive.store(false, Ordering::SeqCst);
+            self.pending.lock().unwrap().remove(&id);
+            return Err(ClientError::ConnectionLost);
         }
-        match receiver.recv_timeout(timeout) {
+        Ok(Reply {
+            link: self,
+            id,
+            receiver,
+        })
+    }
+}
+
+/// The reply to a request already written (`Link::send`).
+pub(crate) struct Reply<'a> {
+    link: &'a Link,
+    id: u64,
+    receiver: Receiver<Result<RawMessage, ClientError>>,
+}
+
+impl Drop for Reply<'_> {
+    fn drop(&mut self) {
+        self.link.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+impl Reply<'_> {
+    pub(crate) fn wait(self, timeout: Duration) -> Result<RawMessage, ClientError> {
+        match self.receiver.recv_timeout(timeout) {
             Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id);
+            Err(RecvTimeoutError::Timeout) => {
+                self.link.pending.lock().unwrap().remove(&self.id);
                 Err(ClientError::Timeout)
             }
-            Err(_) => Err(ClientError::ConnectionLost),
+            Err(RecvTimeoutError::Disconnected) => Err(ClientError::ConnectionLost),
         }
     }
 }
