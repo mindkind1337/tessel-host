@@ -258,6 +258,66 @@ fn expanding_again_reads_the_cache_not_the_disk() {
 }
 
 #[test]
+fn a_root_folder_removed_and_made_again_is_read_again() {
+    let mut home = Home::new("remade");
+    let dir = root_dir(&home);
+    std::fs::write(dir.join("old.txt"), b"1").unwrap();
+    let mut tree = Tree::open(&mut home, &dir);
+    tree.expand(&RelPath::root()).unwrap();
+    assert_eq!(tree.mirror.names(&RelPath::root()), on_disk(&dir));
+
+    // A fresh clone or a deployment: the folder is removed and made again at the same path.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("new.txt"), b"2").unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !tree
+        .mirror
+        .stale
+        .iter()
+        .any(|s| s.path.is_root() && s.reason == StaleReason::Error)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the removed root was never reported stale"
+        );
+        tree.mirror
+            .drain(&mut tree.client, Duration::from_millis(100));
+    }
+    let listing = tree.expand(&RelPath::root()).unwrap();
+    assert!(listing.watched);
+    assert_eq!(
+        tree.mirror.names(&RelPath::root()),
+        on_disk(&dir),
+        "the new folder, not the removed one read as empty"
+    );
+    std::fs::write(dir.join("later.txt"), b"3").unwrap();
+    tree.settle(&RelPath::root(), &dir);
+
+    // Opened again by its path, it is the same root, reading the new folder.
+    let mut other = Tree::open(&mut home, &dir);
+    assert_eq!(other.root, tree.root);
+    other.expand(&RelPath::root()).unwrap();
+    assert_eq!(other.mirror.names(&RelPath::root()), on_disk(&dir));
+
+    // Never expanded (no watch, so no event): the next expansion still reads the new folder.
+    let quiet = home.path.join("quiet");
+    std::fs::create_dir(&quiet).unwrap();
+    std::fs::write(quiet.join("before"), b"").unwrap();
+    let mut unwatched = Tree::open(&mut home, &quiet);
+    std::fs::remove_dir_all(&quiet).unwrap();
+    std::fs::create_dir(&quiet).unwrap();
+    std::fs::write(quiet.join("after"), b"").unwrap();
+    unwatched.expand(&RelPath::root()).unwrap();
+    assert_eq!(unwatched.mirror.names(&RelPath::root()), on_disk(&quiet));
+
+    // Removed for good: refused, never listed as empty.
+    std::fs::remove_dir_all(&quiet).unwrap();
+    let refused = unwatched.expand(&RelPath::root()).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::NotFound);
+}
+
+#[test]
 fn a_directory_changing_while_it_is_read_misses_nothing() {
     let mut home = Home::new("race");
     let dir = root_dir(&home);

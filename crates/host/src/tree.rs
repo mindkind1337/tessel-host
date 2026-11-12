@@ -7,6 +7,9 @@
 //! again. One inotify instance serves the daemon; directories are cached while some connection
 //! keeps them expanded; expanding again reads the cache. When the kernel drops events, every
 //! cached directory is read again (bounded) and its differences sent, then `resynced`.
+//! A root stands for its path: before each use, and every two seconds while folders of it are
+//! kept current, its descriptor is compared with what the path names, and a folder removed and
+//! made again there is opened again (`stale` sent) instead of being read as empty for good.
 use crate::pty::Peer;
 use crate::runtime::random_bytes;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -15,7 +18,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tessel_host_protocol::tree::{
     self, Changed, Entry, EntryKind, Listing, Resynced, RootOpened, Stale, StaleReason, Subscribed,
     TreeLimits, TreeStats,
@@ -38,6 +41,8 @@ const MAX_ENTRIES: usize = 20_000;
 const MAX_ROOTS: usize = 64;
 const RESYNC_DIRS: usize = 512;
 const EVENT_OVERHEAD: usize = 256;
+const ROOT_CHECK_MS: i32 = 2000;
+const ROOT_CHECK: Duration = Duration::from_millis(ROOT_CHECK_MS as u64);
 const WATCH_MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
     | libc::IN_MOVED_FROM
@@ -143,6 +148,50 @@ fn dup(fd: RawFd) -> io::Result<OwnedFd> {
     } else {
         Ok(unsafe { OwnedFd::from_raw_fd(copy) })
     }
+}
+
+type Identity = (libc::dev_t, libc::ino_t);
+
+/// The directory a path names now (following links, as opening it does).
+fn path_identity(path: &std::path::Path) -> io::Result<Identity> {
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: stat is plain data written by stat; a NUL-terminated path.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(cpath.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    Ok((st.st_dev, st.st_ino))
+}
+
+/// The directory a descriptor holds, and whether it still has a name: a removed directory
+/// stays readable through a descriptor, and reads as empty.
+fn fd_identity(fd: RawFd) -> io::Result<(Identity, bool)> {
+    // SAFETY: stat is plain data written by fstat on a descriptor we own.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(((st.st_dev, st.st_ino), st.st_nlink > 0))
+}
+
+fn open_root_dir(path: &std::path::Path) -> Result<OwnedFd, WireError> {
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| refuse(ErrorCode::BadRequest, "invalid root"))?;
+    // SAFETY: a NUL-terminated path; the result is wrapped at once.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(from_errno(&io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn stat_entry(dir: RawFd, name: &[u8], path: &RelPath) -> Option<Entry> {
@@ -424,28 +473,23 @@ impl Trees {
         request.validate()?;
         let path = std::fs::canonicalize(&request.path).map_err(|e| from_errno(&e))?;
         let mut state = self.lock();
-        if let Some((id, root)) = state.roots.iter().find(|(_, r)| r.path == path) {
+        let existing = state
+            .roots
+            .iter()
+            .find(|(_, r)| r.path == path)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = existing {
+            self.ensure_current(&mut state, &id)?;
             return Ok(RootOpened {
-                root: id.clone(),
-                label: root.label.clone(),
+                label: state.roots[&id].label.clone(),
+                root: id,
                 limits: self.limits(),
             });
         }
         if state.roots.len() >= MAX_ROOTS {
             return Err(refuse(ErrorCode::Busy, "too many roots"));
         }
-        let cpath = CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| refuse(ErrorCode::BadRequest, "invalid root"))?;
-        // SAFETY: a NUL-terminated path; the result is wrapped at once.
-        let fd = unsafe {
-            libc::open(
-                cpath.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(from_errno(&io::Error::last_os_error()));
-        }
+        let fd = open_root_dir(&path)?;
         let id = RootId::from_bytes(
             random_bytes().map_err(|_| refuse(ErrorCode::Internal, "no randomness"))?,
         );
@@ -453,7 +497,7 @@ impl Trees {
         state.roots.insert(
             id.clone(),
             Root {
-                fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                fd,
                 path,
                 label: label.clone(),
                 revision: 0,
@@ -467,6 +511,53 @@ impl Trees {
             label,
             limits: self.limits(),
         })
+    }
+
+    /// A root is held by descriptor but stands for its path. When the folder at that path is
+    /// removed and made again (a fresh clone, a deployment), the descriptor still holds the
+    /// removed directory, which reads as empty for good. So before each use the root is checked
+    /// against its path: another directory there is opened instead (the cache of the old one
+    /// dropped, its viewers told to expand again); nothing there any more is refused, never
+    /// listed as empty.
+    fn ensure_current(&self, state: &mut State, id: &RootId) -> Result<(), WireError> {
+        let root = state
+            .roots
+            .get(id)
+            .ok_or_else(|| refuse(ErrorCode::NotFound, "unknown root"))?;
+        let gone = || {
+            refuse(
+                ErrorCode::NotFound,
+                "the root folder is gone; open it again",
+            )
+        };
+        let named = path_identity(&root.path).map_err(|_| gone())?;
+        if let Ok((held, linked)) = fd_identity(root.fd.as_raw_fd())
+            && linked
+            && held == named
+        {
+            return Ok(());
+        }
+        // Opened again only while the path is still its own canonical form: a folder on the
+        // way replaced by a link leads elsewhere, and is not followed.
+        let path = root.path.clone();
+        if std::fs::canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
+            return Err(gone());
+        }
+        let fd = open_root_dir(&path)?;
+        match fd_identity(fd.as_raw_fd()) {
+            Ok((now, true)) if now == named => {}
+            // Changed again meanwhile: the next use looks again.
+            _ => return Err(gone()),
+        }
+        let cached = !root.dirs.is_empty();
+        state.drop_dirs(self.inotify.as_raw_fd(), id, &RelPath::root());
+        if let Some(root) = state.roots.get_mut(id) {
+            root.fd = fd;
+            if cached {
+                root.emit_stale(&RelPath::root(), StaleReason::Error);
+            }
+        }
+        Ok(())
     }
 
     pub fn subscribe(
@@ -538,6 +629,7 @@ impl Trees {
     pub fn expand(&self, request: tree::Expand, peer: &Peer) -> Result<Listing, WireError> {
         let mut guard = self.lock();
         let state = &mut *guard;
+        self.ensure_current(state, &request.root)?;
         let root = state
             .roots
             .get_mut(&request.root)
@@ -659,7 +751,8 @@ impl Trees {
     /// A directory below a root, opened name by name without following links.
     pub fn open_dir(&self, root: &RootId, components: &[Vec<u8>]) -> Result<OwnedFd, WireError> {
         let mut fd = {
-            let state = self.lock();
+            let mut state = self.lock();
+            self.ensure_current(&mut state, root)?;
             let root = state
                 .roots
                 .get(root)
@@ -708,21 +801,50 @@ impl Trees {
         }
     }
 
+    /// The kernel reports a removed directory to its watch only once its last descriptor is
+    /// closed, and the daemon keeps its roots open: a root folder removed (and made again) sends
+    /// nothing, and no parent folder is watched to say so. So roots whose folders are kept
+    /// current are compared with their paths every ROOT_CHECK (two system calls each).
+    fn check_roots(&self) {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let kept: Vec<RootId> = state
+            .roots
+            .iter()
+            .filter(|(_, r)| !r.dirs.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in kept {
+            if self.ensure_current(state, &id).is_err() {
+                // Nothing at its path any more: what its viewers show is out of date.
+                state.drop_dirs(self.inotify.as_raw_fd(), &id, &RelPath::root());
+                if let Some(root) = state.roots.get_mut(&id) {
+                    root.emit_stale(&RelPath::root(), StaleReason::Error);
+                }
+            }
+        }
+    }
+
     fn read_loop(self: Arc<Self>) {
         let delay = std::env::var("TESSEL_HOST_TEST_INOTIFY_DELAY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
         let fd = self.inotify.as_raw_fd();
         let mut buffer = vec![0u8; 256 * 1024];
+        let mut checked = Instant::now();
         loop {
+            if checked.elapsed() >= ROOT_CHECK {
+                self.check_roots();
+                checked = Instant::now();
+            }
             let mut poll = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
             };
             // SAFETY: one valid pollfd.
-            if unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
-                continue;
+            if unsafe { libc::poll(&mut poll, 1, ROOT_CHECK_MS) } <= 0 {
+                continue; // interrupted, or time to look at the roots
             }
             if let Some(ms) = delay {
                 // Test knob only: lets the kernel queue fill, to exercise overflow recovery.
@@ -827,7 +949,17 @@ impl Trees {
             }
         }
         for (root, path) in gone {
+            // The root folder itself moved away (a removal is only seen by check_roots): no
+            // parent folder will say so.
+            let root_left = path.is_root()
+                && state
+                    .roots
+                    .get(&root)
+                    .is_some_and(|r| r.dirs.contains_key(&path));
             state.drop_dirs(inotify, &root, &path);
+            if root_left && let Some(r) = state.roots.get_mut(&root) {
+                r.emit_stale(&path, StaleReason::Error);
+            }
         }
     }
 

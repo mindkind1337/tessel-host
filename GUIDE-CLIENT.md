@@ -173,7 +173,9 @@ let listing = tree.expand(&RelPath::root())?;
   `revision` is above that listing's revision. Keep events of a folder you are still expanding
   until its listing arrives.
 - `Stale { path }`: expand `path` again (from the host's cache: cheap). An empty `path` means
-  the whole root (the client fell behind).
+  the whole root: the client fell behind (`lagging`), or the root folder itself was removed,
+  moved away or made again (`error`). Expanding the root then lists the new folder at that
+  path, or answers `not_found` while nothing is there: show that, not an empty folder.
 - `Resynced`: the host read everything again after the kernel dropped events; the tree is
   complete again.
 - `Relisted(listing)`: after a reconnect (or a daemon restart), replace what is shown for that

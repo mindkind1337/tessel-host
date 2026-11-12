@@ -6,6 +6,19 @@ release below: new fields are optional, and a client relying on one says which r
 
 ## Unreleased
 
+Daemon:
+
+- A root whose folder is removed and made again at the same path (a fresh clone, a deployment)
+  is read again. The daemon held the removed directory's descriptor and listed it as empty, with
+  `ok`, for as long as it ran; reconnecting did not help, since `tree.root.open` handed back the
+  same root by path. Each use of a root now checks it against its path (device and inode): a
+  different folder there is opened instead, under the same root id, its old cache dropped and
+  its subscribers told `Stale { path: "", reason: error }`; a path that names nothing any more
+  answers `not_found`, never an empty listing. While a root has folders kept current, its
+  subscribers get that `Stale` within two seconds of its folder being removed, moved away or made
+  again: the daemon compares it with its path every two seconds, since the kernel says nothing
+  about a removed folder the daemon still holds open, and no parent folder is watched.
+
 Client (`tessel-host-client`), no daemon change:
 
 - Dropping a `Tree` or a `Git` lets go of it on the host. Before, nothing was sent: the
