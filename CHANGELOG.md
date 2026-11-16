@@ -4,7 +4,7 @@ Each release is a tag `v<version>` whose CI publishes the static programs (x86_6
 musl), `manifest.json`, `SHA256SUMS` and `LICENSE`. The protocol version is still 1 in every
 release below: new fields are optional, and a client relying on one says which release it needs.
 
-## Unreleased
+## 0.1.2
 
 Daemon:
 

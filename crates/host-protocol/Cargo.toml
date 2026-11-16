@@ -1,6 +1,6 @@
 [package]
 name = "tessel-host-protocol"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Bounded wire protocol for the native Tessel remote host"
