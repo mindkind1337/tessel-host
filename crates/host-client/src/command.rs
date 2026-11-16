@@ -156,17 +156,19 @@ mod windows_job {
             if !job.is_null() {
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                let set = SetInformationJobObject(
+                // Best effort: kill-on-close also ends the tree if Tessel crashes without dropping
+                // the guard. Even if it does not take, `Job::drop` terminates the job on a normal
+                // close, so the assignment (membership) is the only step we require to succeed.
+                let _ = SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     std::ptr::addr_of!(info).cast(),
                     std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 );
-                let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE);
-                if set != 0 && assigned != 0 {
+                if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0 {
                     return Box::new(JobKiller {
-                        _child: child,
                         _job: Job(job),
+                        _child: child,
                     });
                 }
                 CloseHandle(job);
@@ -192,9 +194,10 @@ mod windows_job {
         }
     }
 
-    /// Keeps the child's handle open until its job is terminated (fields drop in order).
+    /// Terminates the job (killing the whole tree) before the child's own handle is closed: fields
+    /// drop in declaration order.
     struct JobKiller {
-        _child: Child,
         _job: Job,
+        _child: Child,
     }
 }
