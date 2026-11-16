@@ -49,6 +49,56 @@ fn dropping_the_pipe_ends_the_command() {
     drop(pipe.writer);
 }
 
+/// On Linux (where `libc` is available to the tests and CI runs), a pid that was killed but whose
+/// reaper has not collected it yet lingers as a zombie: counted as gone, so timing never flakes.
+#[cfg(target_os = "linux")]
+fn gone_or_zombie(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks whether the pid exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return true;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // `pid (comm) state ...`; comm may hold ')' and spaces, so read the state after the last.
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        Err(_) => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_the_pipe_ends_the_whole_process_group() {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+    // The shell leads its own group; the backgrounded sleep is a grandchild in that same group.
+    let connector = CommandConnector::new("sh", ["-c", "sleep 30 & echo $!; wait"]);
+    let pipe = connector.connect().unwrap();
+    let mut reader = std::io::BufReader::new(pipe.reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let grandchild: i32 = line.trim().parse().expect("the grandchild's pid");
+    // SAFETY: signal 0 only checks whether the pid exists.
+    assert_eq!(
+        unsafe { libc::kill(grandchild, 0) },
+        0,
+        "the grandchild is alive before the connection is dropped"
+    );
+    drop(pipe.guard);
+    drop(pipe.writer);
+    drop(reader);
+    // Dropping the connection kills ssh's whole group, the grandchild included (not ssh alone).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gone_or_zombie(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "the grandchild outlived the connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_missing_program_is_an_error_not_a_panic() {
     let connector = CommandConnector::new(

@@ -186,6 +186,21 @@ fn cancelling_the_first_connection_stops_it_at_once() {
 }
 
 #[test]
+fn an_opening_cancelled_before_it_starts_never_connects() {
+    let fake = Fake::new(&[Daemon::Silent]);
+    let opening = Arc::new(Opening::default());
+    // Abandoned before the attempt begins (a close that races the connection's start).
+    opening.cancel();
+    let result = Client::connect_cancellable(
+        Box::new(Shared(fake.clone())),
+        options(Duration::from_secs(60)),
+        opening,
+    );
+    assert!(matches!(result, Err(ClientError::ConnectionLost)));
+    assert_eq!(fake.attempts(), 0, "a cancelled opening starts no process");
+}
+
+#[test]
 fn half_a_hello_times_out_too() {
     let fake = Fake::new(&[Daemon::Partial]);
     let started = Instant::now();

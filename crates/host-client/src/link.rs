@@ -155,6 +155,12 @@ impl Link {
         let (sender, receiver) = channel::<Opened>();
         let worker = opening.clone();
         std::thread::spawn(move || {
+            if worker.cancelled() {
+                // Abandoned before this thread began (a `close` that raced its start): do not run
+                // the connector at all, so no process (an ssh) is spawned only to be killed at
+                // once. The waiting thread sees the same cancelled opening and returns.
+                return;
+            }
             let Pipe {
                 mut reader,
                 mut writer,
